@@ -134,10 +134,19 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 # ==============================================================================
 
 def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[int]:
-    """Finds the most specific METHOD node matching method_name."""
+    """Finds the most specific METHOD node matching method_name, prioritizing real implementation bodies over compiler adapters."""
     nodes = find_nodes(graph, label="METHOD", code_contains=method_name)
     if not nodes:
         nodes = find_nodes(graph, label="METHOD", name=method_name)
+
+    # Filter out compiler-generated adapter wrappers (<metaClassAdapter>)
+    real_nodes = [
+        n for n in nodes
+        if "<metaClassAdapter>" not in str(graph.nodes[n].get("code", ""))
+        and "<metaClassAdapter>" not in str(graph.nodes[n].get("name", ""))
+    ]
+    if real_nodes:
+        return real_nodes[0]
     return nodes[0] if nodes else None
 
 
@@ -145,14 +154,42 @@ def dispatch_tool(
     graph: nx.MultiDiGraph, tool_name: str, arguments: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Executes a requested tool call against the loaded NetworkX CPG graph."""
-    method_name = arguments.get("method_name", "")
+    method_name = arguments.get("method_name", "").strip()
     method_id = resolve_method_node(graph, method_name) if method_name else None
 
-    if method_name and method_id is None:
-        return {
-            "error": f"Method '{method_name}' was not found in the Code Property Graph.",
-            "suggestion": "Check the method name spelling or try listing known methods.",
-        }
+    # Handle wildcards, class names, or missing methods gracefully by listing methods
+    if method_name in ("*", "all", "list", "") or (method_name and method_id is None):
+        all_methods = []
+        seen = set()
+        for n in find_nodes(graph, label="METHOD"):
+            m_code = graph.nodes[n].get("code", "")
+            if m_code and not m_code.startswith("<") and not m_code.endswith("<metaClassAdapter>"):
+                if m_code not in seen:
+                    seen.add(m_code)
+                    all_methods.append({
+                        "node_id": n,
+                        "name": m_code,
+                        "line": graph.nodes[n].get("line_number"),
+                    })
+
+        matching = [
+            m for m in all_methods
+            if method_name == "*" or method_name.lower() in str(m["name"]).lower()
+        ]
+        if matching and len(matching) == 1:
+            method_id = matching[0]["node_id"]
+        elif matching:
+            return {
+                "info": f"Found {len(matching)} methods related to '{method_name}':",
+                "available_methods": [m["name"] for m in matching[:15]],
+                "hint": "Please call the tool specifying one of the method names listed above.",
+            }
+        else:
+            return {
+                "error": f"Method or class '{method_name}' was not found in the Code Property Graph.",
+                "available_methods": [m["name"] for m in all_methods[:15]],
+                "suggestion": "Select one of the available methods listed above.",
+            }
 
     try:
         if tool_name == "traverse_ast":
