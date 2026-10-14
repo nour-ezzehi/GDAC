@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
-from agent_tools import TOOLS_SCHEMA, dispatch_tool
+from agent_tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
 from cpg_bridge import load_cpg_json
+from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 
 
 # ==============================================================================
@@ -123,6 +124,16 @@ def run_agent_loop(
     """Executes the multi-turn Graph of Thoughts debugging agent loop."""
     import torch
 
+    # Reset stateful tool execution memory buffer
+    reset_tool_memory()
+
+    # Automatically index CPG and inject top semantic entry points if not already present
+    if "Recommended Semantic Entry Points" not in problem_prompt:
+        entry_points = find_semantic_entry_points(graph, problem_prompt, top_k=2)
+        ep_block = format_entry_points_markdown(entry_points)
+        if ep_block:
+            problem_prompt = f"{problem_prompt}\n\n{ep_block}"
+
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": GRAPH_OF_THOUGHTS_SYSTEM_PROMPT},
         {"role": "user", "content": problem_prompt},
@@ -199,32 +210,42 @@ def run_agent_loop(
 
 def run_mock_agent(graph: Any, problem_type: str = "discount") -> None:
     """Demonstrates the complete Graph of Thoughts loop locally without needing a GPU."""
+    reset_tool_memory()
+
     print("=" * 65)
-    print("  Graph of Thoughts Agent (Dry-Run Simulation)")
+    print("  Graph of Thoughts Agent (Dry-Run Simulation with Upgrades)")
+    print("  - Macro-Tools (Algorithmic Offloading via NetworkX)")
+    print("  - Hybrid GraphRAG Semantic Entry Points")
+    print("  - Stateful Anti-Looping Memory Buffer")
     print("=" * 65)
 
     if problem_type == "discount":
         target_method = "apply_discount"
         target_var = "discount_percent"
         failing_test = (
-            "FAILED tests/test_inventory.py::test_apply_discount\n"
+            "FAILED tests/test_inventory.py::TestInventoryManager::test_apply_discount\n"
             "AssertionError: 20.0 != 80.0\n"
             "Notes: Applying a 20% discount on $100 resulted in $20.00 instead of $80.00."
         )
     else:
         target_method = "generate_category_summary"
-        target_var = "summary"
+        target_var = "item_total"
         failing_test = (
-            "FAILED tests/test_reports.py::test_generate_category_summary_aggregates_multiple_items\n"
+            "FAILED tests/test_reports.py::TestInventoryReporter::test_generate_category_summary_aggregates_multiple_items\n"
             "AssertionError: 250.0 != 1000.0\n"
             "Notes: Total category value only shows the last item's value ($250) instead of sum ($1000)."
         )
 
     print(f"\n[Problem]:\n{failing_test}\n")
 
+    # Step 0: Hybrid GraphRAG Entry Points
+    print("--- [GoT Node 0: Semantic Entry Point Discovery (Hybrid GraphRAG)] ---")
+    entry_points = find_semantic_entry_points(graph, failing_test, top_k=2)
+    print(format_entry_points_markdown(entry_points))
+
     # Step 1: Hypothesis
-    print("--- [GoT Node 1: Hypothesis Formulation] ---")
-    print(f"Agent Hypothesis: The failure points directly to `{target_method}`. Suspected variable: `{target_var}`.")
+    print("\n--- [GoT Node 1: Hypothesis Formulation] ---")
+    print(f"Agent Hypothesis: Based on semantic entry points, focusing on `{target_method}`. Suspected variable: `{target_var}`.")
 
     # Step 2: AST Traversal
     print(f"\n--- [GoT Node 2: Syntactic Discovery (AST)] ---")
@@ -235,24 +256,25 @@ def run_mock_agent(graph: Any, problem_type: str = "discount") -> None:
         indent = "  " * n["depth"]
         print(f"  {indent}- [{n['label']}] L{n.get('line')}: {n.get('code')}")
 
-    # Step 3: CFG Traversal
-    print(f"\n--- [GoT Node 3: Execution Path Tracing (CFG)] ---")
-    cfg_res = dispatch_tool(graph, "traverse_cfg", {"method_name": target_method, "max_paths": 2})
-    print(f"Tool Call: traverse_cfg(method_name='{target_method}')")
-    print(f"Observations: Traced {cfg_res.get('paths_count')} execution path(s):")
-    for p in cfg_res.get("execution_paths", []):
-        print(f"  Execution Path #{p['path_index']} ({p['length']} steps):")
-        for s in p["steps"][:4]:
-            print(f"    -> {s}")
+    # Step 3: Anti-Looping Interception Test
+    print(f"\n--- [GoT Node 3: Anti-Looping Deterministic Memory Test] ---")
+    print(f"Attempting duplicate call: traverse_ast(method_name='{target_method}')")
+    dup_res = dispatch_tool(graph, "traverse_ast", {"method_name": target_method, "max_depth": 3})
+    print(f"Interceptor Response: {dup_res}")
 
-    # Step 4: Data Flow Traversal
-    print(f"\n--- [GoT Node 4: Data Flow & Taint Tracking] ---")
-    df_res = dispatch_tool(graph, "traverse_data_flow", {"method_name": target_method, "var_name": target_var})
-    print(f"Tool Call: traverse_data_flow(method_name='{target_method}', var_name='{target_var}')")
-    print(f"Observations: Found {df_res.get('traces_found')} data flow propagation trace(s):")
-    for t in df_res.get("data_flow_traces", []):
-        for s in t["steps"][:5]:
-            print(f"    ~> {s}")
+    # Step 4: Macro-Tool Algorithmic Offloading
+    print(f"\n--- [GoT Node 4: Macro-Tool Data Flow Offloading (trace_variable_to_sink)] ---")
+    macro_res = dispatch_tool(
+        graph, "trace_variable_to_sink", {"method_name": target_method, "var_name": target_var}
+    )
+    print(f"Tool Call: trace_variable_to_sink(method_name='{target_method}', var_name='{target_var}')")
+    print(f"[Algorithmic NetworkX Summary]:\n  {macro_res.get('summary')}\n")
+    print(f"Origin: {macro_res.get('origin')}")
+    print(f"Terminal Sink: {macro_res.get('terminal_sink')}")
+    print("Propagation Path:")
+    for step in macro_res.get("propagation_path", []):
+        line_str = f"L{step.get('line')}: " if step.get("line") else ""
+        print(f"    ~> [{step.get('label')}] {line_str}{step.get('code')}")
 
     # Step 5: Final Deduction & Patch
     print(f"\n--- [GoT Node 5: Synthesis & Root Cause Deduction] ---")

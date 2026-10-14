@@ -379,6 +379,188 @@ def traverse_data_flow(
     return formatted_traces
 
 
+def trace_variable_to_sink(
+    graph: nx.MultiDiGraph,
+    start_node_id: Optional[int] = None,
+    method_name: Optional[str] = None,
+    var_name: Optional[str] = None,
+    sink_node_id: Optional[int] = None,
+    max_hops: int = 30,
+) -> Dict[str, Any]:
+    """Macro-Tool: Algorithmic multi-hop data flow traversal.
+
+    Uses NetworkX graph algorithms (nx.all_simple_paths / nx.shortest_path)
+    to trace a variable across the Data Dependence Graph from its origin to
+    terminal sinks, returning a compact, human-readable summary.
+    """
+    # 1. Resolve start node if omitted
+    if start_node_id is None:
+        if not method_name:
+            raise ValueError("Either start_node_id or method_name must be provided.")
+
+        candidates = find_nodes(graph, label="METHOD", code_contains=method_name)
+        if not candidates:
+            candidates = find_nodes(graph, label="METHOD", name=method_name)
+        real_methods = [
+            n for n in candidates
+            if "<metaClassAdapter>" not in str(graph.nodes[n].get("code", ""))
+            and "<metaClassAdapter>" not in str(graph.nodes[n].get("name", ""))
+        ]
+        target_m = real_methods[0] if real_methods else (candidates[0] if candidates else None)
+        if target_m is None:
+            raise ValueError(f"Method '{method_name}' not found in CPG.")
+
+        if var_name:
+            ast_edges = [(u, v) for u, v, d in graph.edges(data=True) if d.get("label") == "AST"]
+            ast_digraph = nx.DiGraph(ast_edges)
+            ast_desc = nx.descendants(ast_digraph, target_m) if target_m in ast_digraph else set()
+            ast_desc.add(target_m)
+
+            var_nodes = [n for n in find_nodes(graph, code_contains=var_name) if n in ast_desc]
+            param_nodes = [n for n in var_nodes if graph.nodes[n].get("label") == "PARAM"]
+            assign_nodes = [n for n in var_nodes if "assignment" in str(graph.nodes[n].get("label", ""))]
+
+            if param_nodes:
+                start_node_id = param_nodes[0]
+            elif assign_nodes:
+                start_node_id = assign_nodes[0]
+            elif var_nodes:
+                start_node_id = var_nodes[0]
+            else:
+                start_node_id = target_m
+        else:
+            start_node_id = target_m
+
+    if start_node_id not in graph:
+        raise ValueError(f"Start node #{start_node_id} not found in graph.")
+
+    # 2. Build Data Flow Subgraph
+    df_edge_labels = {"REACHING_DEF", "DDG", "ARGUMENT", "REF"}
+    df_graph = nx.DiGraph()
+    for u, v, d in graph.edges(data=True):
+        lbl = d.get("label", "").upper()
+        if lbl in df_edge_labels:
+            df_graph.add_edge(u, v, label=lbl, variable=d.get("variable"))
+
+    if start_node_id not in df_graph:
+        out_ddg = [v for _, v, d in graph.out_edges(start_node_id, data=True) if d.get("label") in df_edge_labels]
+        if not out_ddg:
+            node_desc = get_node_label_summary(graph, start_node_id)
+            return {
+                "variable": var_name or graph.nodes[start_node_id].get("name"),
+                "origin_node": node_desc,
+                "summary": f"No data flow edges emanate from {node_desc}.",
+                "paths": [],
+                "sinks": [],
+            }
+
+    # 3. Detect candidate sinks
+    if sink_node_id is not None:
+        candidate_sinks = [sink_node_id] if sink_node_id in df_graph else []
+    else:
+        reachable = nx.descendants(df_graph, start_node_id)
+        candidate_sinks = [
+            n for n in reachable
+            if graph.nodes[n].get("label") in ("RETURN", "METHOD_RETURN")
+            or df_graph.out_degree(n) == 0
+        ]
+
+    # 4. Compute paths
+    raw_paths: List[List[int]] = []
+    for s in candidate_sinks:
+        try:
+            paths_iter = nx.all_simple_paths(df_graph, source=start_node_id, target=s, cutoff=max_hops)
+            for p in paths_iter:
+                raw_paths.append(p)
+                if len(raw_paths) >= 20:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+
+    if not raw_paths and candidate_sinks:
+        for s in candidate_sinks:
+            try:
+                p = nx.shortest_path(df_graph, source=start_node_id, target=s)
+                raw_paths.append(p)
+                break
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pass
+
+    # 5. Format and summarize paths
+    origin_data = graph.nodes.get(start_node_id, {})
+    origin_summary = get_node_label_summary(graph, start_node_id)
+    target_var_str = var_name or origin_data.get("name") or origin_data.get("code") or "variable"
+
+    if not raw_paths:
+        return {
+            "variable": target_var_str,
+            "origin_node": origin_summary,
+            "summary": f"Variable '{target_var_str}' at {origin_summary} has no reaching data flow sinks within {max_hops} hops.",
+            "paths": [],
+            "sinks": [get_node_label_summary(graph, s) for s in candidate_sinks[:3]],
+        }
+
+    def path_richness_score(p: List[int]) -> int:
+        score = len(p)
+        for nid in p:
+            lbl = str(graph.nodes[nid].get("label", "")).lower()
+            code = str(graph.nodes[nid].get("code", "")).lower()
+            if any(k in lbl or k in code for k in ("multiplication", "division", "plus", "minus", "round", "assignment", "return")):
+                score += 5
+        return score
+
+    raw_paths.sort(key=path_richness_score, reverse=True)
+    best_path = raw_paths[0]
+
+    formatted_paths = []
+    for idx, p in enumerate(raw_paths[:3], 1):
+        steps = []
+        for nid in p:
+            ndata = graph.nodes.get(nid, {})
+            steps.append({
+                "node_id": nid,
+                "label": ndata.get("label", "NODE"),
+                "line": ndata.get("line_number"),
+                "code": ndata.get("code") or ndata.get("name"),
+            })
+        formatted_paths.append({"path_id": idx, "hops": len(p), "steps": steps})
+
+    narrative_steps = []
+    for nid in best_path:
+        nd = graph.nodes.get(nid, {})
+        lbl = nd.get("label", "NODE")
+        line = nd.get("line_number")
+        line_str = f"L{line}: " if line else ""
+        code = nd.get("code") or nd.get("name") or ""
+        if len(code) > 60:
+            code = code[:57] + "..."
+        narrative_steps.append(f"[{lbl}] {line_str}{code}".strip())
+
+    origin_step = narrative_steps[0]
+    terminal_step = narrative_steps[-1]
+    intermediate_steps = narrative_steps[1:-1]
+
+    if intermediate_steps:
+        summary_text = (
+            f"Variable '{target_var_str}' originates at {origin_step}, "
+            f"flows through {len(intermediate_steps)} intermediate operations "
+            f"({'; '.join(intermediate_steps[:3])}), and terminates at {terminal_step}."
+        )
+    else:
+        summary_text = f"Variable '{target_var_str}' originates at {origin_step} and flows directly into {terminal_step}."
+
+    return {
+        "variable": target_var_str,
+        "origin": origin_summary,
+        "terminal_sink": terminal_step,
+        "total_paths_found": len(raw_paths),
+        "summary": summary_text,
+        "detailed_path": formatted_paths[0]["steps"],
+        "alternate_paths_count": max(0, len(raw_paths) - 1),
+    }
+
+
+
 # ==============================================================================
 # 4. CLI Entrypoint
 # ==============================================================================

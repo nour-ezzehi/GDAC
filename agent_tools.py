@@ -9,12 +9,13 @@ dispatcher to invoke them on a loaded NetworkX MultiDiGraph.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import networkx as nx
 
 from cpg_bridge import (
     find_nodes,
     get_node_label_summary,
+    trace_variable_to_sink,
     traverse_ast,
     traverse_cfg,
     traverse_data_flow,
@@ -126,6 +127,35 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "trace_variable_to_sink",
+            "description": (
+                "Macro-Tool: Algorithmic multi-hop data flow traversal. Uses NetworkX graph algorithms to automatically "
+                "trace a variable or parameter from its origin through all intermediate mutations/calculations to its terminal sinks "
+                "(return statements, assignments, or consumers). Returns a clean, human-readable summary of the entire propagation path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method_name": {
+                        "type": "string",
+                        "description": "Name or substring of the method containing the variable (e.g. 'apply_discount' or 'generate_category_summary').",
+                    },
+                    "var_name": {
+                        "type": "string",
+                        "description": "Optional name of the variable or parameter to trace (e.g. 'discount_percent', 'item_total', or 'summary').",
+                    },
+                    "start_node_id": {
+                        "type": "integer",
+                        "description": "Optional specific starting node ID. If omitted, automatically resolves variable origin.",
+                    },
+                },
+                "required": ["method_name"],
+            },
+        },
+    },
 ]
 
 
@@ -150,8 +180,69 @@ def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[in
     return nodes[0] if nodes else None
 
 
+class ToolMemoryBuffer:
+    """Deterministic stateful memory buffer preventing repetitive tool invocation loops."""
+
+    def __init__(self) -> None:
+        self.visited_signatures: Set[Tuple[str, ...]] = set()
+        self.visited_nodes: Set[Tuple[str, int]] = set()
+        self.history: List[Dict[str, Any]] = []
+
+    def check_and_record(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        resolved_node_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Checks if a tool invocation or target node was already explored.
+
+        Returns an interception error message if repeated, or None if new.
+        """
+        method_name = str(arguments.get("method_name", "")).strip().lower()
+        var_name = str(arguments.get("var_name", "")).strip().lower()
+        node_id_arg = arguments.get("node_id") or arguments.get("start_node_id") or arguments.get("source_node_id")
+
+        canonical_sig = (
+            tool_name,
+            method_name,
+            var_name,
+            str(node_id_arg or ""),
+            str(arguments.get("filter_labels") or ""),
+        )
+
+        if canonical_sig in self.visited_signatures:
+            return "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
+
+        if resolved_node_id is not None:
+            node_key = (tool_name, resolved_node_id)
+            if node_key in self.visited_nodes and not var_name:
+                return "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
+            self.visited_nodes.add(node_key)
+
+        self.visited_signatures.add(canonical_sig)
+        self.history.append({"tool": tool_name, "args": arguments, "node_id": resolved_node_id})
+        return None
+
+    def clear(self) -> None:
+        """Clears memory for a fresh debugging session."""
+        self.visited_signatures.clear()
+        self.visited_nodes.clear()
+        self.history.clear()
+
+
+GLOBAL_TOOL_MEMORY = ToolMemoryBuffer()
+
+
+def reset_tool_memory() -> None:
+    """Resets global tool execution memory."""
+    GLOBAL_TOOL_MEMORY.clear()
+
+
 def dispatch_tool(
-    graph: nx.MultiDiGraph, tool_name: str, arguments: Dict[str, Any]
+    graph: nx.MultiDiGraph,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    memory: Optional[ToolMemoryBuffer] = None,
 ) -> Dict[str, Any]:
     """Executes a requested tool call against the loaded NetworkX CPG graph."""
     method_name = arguments.get("method_name", "").strip()
@@ -190,6 +281,12 @@ def dispatch_tool(
                 "available_methods": [m["name"] for m in all_methods[:15]],
                 "suggestion": "Select one of the available methods listed above.",
             }
+
+    # Anti-looping interceptor: check deterministic memory buffer
+    mem = memory if memory is not None else GLOBAL_TOOL_MEMORY
+    loop_error = mem.check_and_record(tool_name, arguments, resolved_node_id=method_id)
+    if loop_error:
+        return {"error": loop_error}
 
     try:
         if tool_name == "traverse_ast":
@@ -248,11 +345,20 @@ def dispatch_tool(
             # If no source_id provided, look for matching parameter or assignment
             if source_id is None and method_id is not None:
                 if var_name:
-                    param_nodes = [
+                    var_nodes = [
                         n for n in find_nodes(graph, code_contains=var_name)
                         if n in nx.descendants(graph, method_id) or n == method_id
                     ]
-                    source_id = param_nodes[0] if param_nodes else method_id
+                    param_nodes = [n for n in var_nodes if graph.nodes[n].get("label") == "PARAM"]
+                    assign_nodes = [n for n in var_nodes if "assignment" in str(graph.nodes[n].get("label", ""))]
+                    if param_nodes:
+                        source_id = param_nodes[0]
+                    elif assign_nodes:
+                        source_id = assign_nodes[0]
+                    elif var_nodes:
+                        source_id = var_nodes[0]
+                    else:
+                        source_id = method_id
                 else:
                     source_id = method_id
 
@@ -276,6 +382,26 @@ def dispatch_tool(
                 "tracked_variable": var_name,
                 "traces_found": len(traces),
                 "data_flow_traces": formatted_traces,
+            }
+
+        elif tool_name == "trace_variable_to_sink":
+            var_name = arguments.get("var_name")
+            start_id = arguments.get("start_node_id")
+            result = trace_variable_to_sink(
+                graph,
+                start_node_id=start_id,
+                method_name=method_name,
+                var_name=var_name,
+            )
+            return {
+                "tool": "trace_variable_to_sink",
+                "method": method_name,
+                "variable": result.get("variable"),
+                "origin": result.get("origin"),
+                "terminal_sink": result.get("terminal_sink"),
+                "total_paths_found": result.get("total_paths_found"),
+                "summary": result.get("summary"),
+                "propagation_path": result.get("detailed_path"),
             }
 
         else:

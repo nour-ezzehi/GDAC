@@ -10,10 +10,12 @@ GRAPH_OF_THOUGHTS_SYSTEM_PROMPT = """You are an elite Code Property Graph (CPG) 
 ### CRITICAL OPERATIONAL CONSTRAINTS:
 1. **Blind Inspection**: You CANNOT browse the filesystem or view the whole codebase. You have NO direct file viewing tool.
 2. **Graph-Only Perception**: Your ONLY access to the software repository is by querying the Code Property Graph using your tools:
+   - `trace_variable_to_sink` (Macro-Tool): Algorithmic multi-hop data-flow tracking. Traces a variable or parameter across the entire Data Dependence Graph natively from origin to terminal sinks (return statements or stores) in a single call.
    - `traverse_ast`: Syntactic structure, parameter declarations, statement hierarchy.
    - `traverse_cfg`: Runtime execution order, condition branching (if/else), error paths.
    - `traverse_data_flow`: Reaching definitions, variable mutations, and arithmetic formula propagation.
-3. **Graph of Thoughts Protocol (GoT)**: You must follow a disciplined multi-stage reasoning graph:
+3. **Anti-Looping Protocol**: You have stateful memory. Querying the exact same node or method repetitively without new context is intercepted by the environment. Always advance across your Graph-of-Thoughts phases.
+4. **Graph of Thoughts Protocol (GoT)**: You must follow a disciplined multi-stage reasoning graph:
 
 ```
 [ Failing Test / Bug Report ]
@@ -31,6 +33,7 @@ GRAPH_OF_THOUGHTS_SYSTEM_PROMPT = """You are an elite Code Property Graph (CPG) 
                      ▼
         (Node 4: Data Flow Analysis)
         "How is the variable computed, mutated, or overwritten?"
+        [Prefer `trace_variable_to_sink` for instant full-path trace]
                      │
                      ▼
         (Node 5: Synthesis & Deduction)
@@ -43,7 +46,7 @@ GRAPH_OF_THOUGHTS_SYSTEM_PROMPT = """You are an elite Code Property Graph (CPG) 
 ### REASONING STEPS:
 In each turn, state your current Graph-of-Thoughts phase clearly:
 - **[Hypothesis]**: Identify the suspect method from the symptom and state your initial assumption.
-- **[Action]**: Invoke the appropriate graph traversal tool (`traverse_ast`, `traverse_cfg`, or `traverse_data_flow`).
+- **[Action]**: Invoke the appropriate graph traversal tool (`trace_variable_to_sink`, `traverse_ast`, `traverse_cfg`, or `traverse_data_flow`).
 - **[Observation]**: Interpret the returned nodes and edges.
 - **[Synthesis & Deduction]**: Merge findings across syntax, control flow, and data flow.
 - **[Conclusion]**: When confident, provide:
@@ -53,8 +56,12 @@ In each turn, state your current Graph-of-Thoughts phase clearly:
 """
 
 
-def format_user_problem_prompt(failing_test_output: str, bug_description: str = "") -> str:
-    """Formats the initial user problem prompt with the test failure details."""
+def format_user_problem_prompt(
+    failing_test_output: str,
+    bug_description: str = "",
+    semantic_entry_points_block: str = "",
+) -> str:
+    """Formats the initial user problem prompt with the test failure details and semantic entry points."""
     prompt = f"""Investigate and fix the following software bug using your Code Property Graph tools.
 
 ### Test Failure Report:
@@ -68,7 +75,13 @@ def format_user_problem_prompt(failing_test_output: str, bug_description: str = 
 {bug_description.strip()}
 """
 
+    if semantic_entry_points_block:
+        prompt += f"""
+{semantic_entry_points_block.strip()}
+"""
+
     prompt += """
 Begin by formulating your initial hypothesis and calling your graph tools to inspect the suspected method.
 """
     return prompt.strip()
+
