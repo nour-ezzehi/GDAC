@@ -2,8 +2,8 @@
 
 from typing import Dict, List, Optional
 
-from stockflow.models import Item, Transaction
-from stockflow.storage import JsonStorage
+from stackflow.models import Item, Transaction
+from stackflow.storage import JsonStorage
 
 
 class ItemNotFoundError(KeyError):

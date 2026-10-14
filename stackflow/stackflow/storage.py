@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 
-from stockflow.models import Item
+from stackflow.models import Item
 
 
 class JsonStorage:

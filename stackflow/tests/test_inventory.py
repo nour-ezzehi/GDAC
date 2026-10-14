@@ -2,7 +2,7 @@
 
 import unittest
 
-from stockflow.inventory import (
+from stackflow.inventory import (
     InventoryManager,
     ItemNotFoundError,
     InsufficientStockError,

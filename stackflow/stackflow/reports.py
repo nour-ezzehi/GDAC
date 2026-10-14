@@ -2,8 +2,8 @@
 
 from typing import Dict, List
 
-from stockflow.inventory import InventoryManager
-from stockflow.models import Item
+from stackflow.inventory import InventoryManager
+from stackflow.models import Item
 
 
 class InventoryReporter:

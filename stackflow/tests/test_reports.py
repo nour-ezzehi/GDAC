@@ -2,8 +2,8 @@
 
 import unittest
 
-from stockflow.inventory import InventoryManager
-from stockflow.reports import InventoryReporter
+from stackflow.inventory import InventoryManager
+from stackflow.reports import InventoryReporter
 
 
 class TestInventoryReporter(unittest.TestCase):
