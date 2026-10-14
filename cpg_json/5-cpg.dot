@@ -1,0 +1,23 @@
+digraph "&lt;body&gt;" {  
+node [shape="rect"];  
+"107374182405" [label = <METHOD, 14<BR/>&lt;body&gt;> ]
+"25769803786" [label = <BLOCK, 14<BR/>> ]
+"90194313253" [label = <LITERAL, 15<BR/>&quot;&quot;&quot;Raised when attempting to deduct more items ...<BR/>> ]
+"30064771115" [label = <&lt;operator&gt;.pass, 16<BR/>pass> ]
+"128849018887" [label = <> ]
+"111669149698" [label = <PARAM, 14<BR/>cls> ]
+"124554051589" [label = <METHOD_RETURN, 14<BR/>ANY> ]
+  "107374182405" -> "128849018887"  [ label = "AST: "] 
+  "107374182405" -> "111669149698"  [ label = "AST: "] 
+  "107374182405" -> "25769803786"  [ label = "AST: "] 
+  "107374182405" -> "124554051589"  [ label = "AST: "] 
+  "25769803786" -> "90194313253"  [ label = "AST: "] 
+  "25769803786" -> "30064771115"  [ label = "AST: "] 
+  "30064771115" -> "124554051589"  [ label = "CFG: "] 
+  "107374182405" -> "30064771115"  [ label = "CFG: "] 
+  "111669149698" -> "124554051589"  [ label = "DDG: cls"] 
+  "30064771115" -> "124554051589"  [ label = "DDG: pass"] 
+  "107374182405" -> "111669149698"  [ label = "DDG: "] 
+  "107374182405" -> "90194313253"  [ label = "DDG: "] 
+  "107374182405" -> "30064771115"  [ label = "DDG: "] 
+}

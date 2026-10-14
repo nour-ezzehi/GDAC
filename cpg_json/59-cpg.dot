@@ -1,0 +1,16 @@
+digraph "&lt;module&gt;" {  
+node [shape="rect"];  
+"107374182459" [label = <METHOD, 1<BR/>&lt;module&gt;> ]
+"25769803908" [label = <BLOCK, 1<BR/>> ]
+"90194313359" [label = <LITERAL, 1<BR/>&quot;&quot;&quot;Unit test suite for StackFlow.&quot;&quot;&quot;<BR/>> ]
+"128849018946" [label = <> ]
+"128849018947" [label = <> ]
+"124554051643" [label = <METHOD_RETURN, 1<BR/>ANY> ]
+  "107374182459" -> "128849018946"  [ label = "AST: "] 
+  "107374182459" -> "25769803908"  [ label = "AST: "] 
+  "107374182459" -> "128849018947"  [ label = "AST: "] 
+  "107374182459" -> "124554051643"  [ label = "AST: "] 
+  "25769803908" -> "90194313359"  [ label = "AST: "] 
+  "107374182459" -> "124554051643"  [ label = "CFG: "] 
+  "107374182459" -> "90194313359"  [ label = "DDG: "] 
+}

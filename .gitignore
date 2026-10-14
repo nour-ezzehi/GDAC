@@ -1,5 +1,4 @@
 .venv/
 cpg.bin
-cpg_json/
 __pycache__/
 *.py[cod]
