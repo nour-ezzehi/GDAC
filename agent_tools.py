@@ -41,7 +41,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415' or 107374182415 from semantic entry points), qualified name ('InventoryManager.apply_discount'), or method name ('apply_discount').",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '100000000001' from semantic entry points), qualified name ('ClassName.method_name'), or method name ('method_name').",
                     },
                     "method_name": {
                         "type": "string",
@@ -78,7 +78,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
                     },
                     "method_name": {
                         "type": "string",
@@ -114,7 +114,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
                     },
                     "method_name": {
                         "type": "string",
@@ -122,7 +122,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     },
                     "var_name": {
                         "type": "string",
-                        "description": "Optional name of the variable or parameter to trace (e.g. 'discount_percent' or 'summary').",
+                        "description": "Optional name of the variable or parameter to trace (e.g. 'result' or 'total').",
                     },
                     "source_node_id": {
                         "type": "integer",
@@ -150,7 +150,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
                     },
                     "method_name": {
                         "type": "string",
@@ -158,7 +158,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     },
                     "var_name": {
                         "type": "string",
-                        "description": "Optional name of the variable or parameter to trace (e.g. 'discount_percent', 'item_total', or 'summary').",
+                        "description": "Optional name of the variable or parameter to trace (e.g. 'result', 'total', or 'data').",
                     },
                     "start_node_id": {
                         "type": "integer",
