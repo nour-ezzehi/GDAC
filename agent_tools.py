@@ -39,13 +39,17 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415' or 107374182415 from semantic entry points), qualified name ('InventoryManager.apply_discount'), or method name ('apply_discount').",
+                    },
                     "method_name": {
                         "type": "string",
-                        "description": "Name or substring of the method to inspect (e.g. 'apply_discount' or 'generate_category_summary').",
+                        "description": "Optional legacy alias for target method name.",
                     },
                     "node_id": {
                         "type": "integer",
-                        "description": "Optional specific AST node ID to start traversal from. If omitted, starts from method entry.",
+                        "description": "Optional specific AST node ID to start traversal from.",
                     },
                     "filter_labels": {
                         "type": "array",
@@ -57,7 +61,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                         "description": "Maximum tree depth to explore (default: 4).",
                     },
                 },
-                "required": ["method_name"],
             },
         },
     },
@@ -73,13 +76,17 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                    },
                     "method_name": {
                         "type": "string",
-                        "description": "Name or substring of the method to inspect (e.g. 'apply_discount').",
+                        "description": "Optional legacy alias for target method name.",
                     },
                     "start_node_id": {
                         "type": "integer",
-                        "description": "Optional specific CFG node ID to start from. If omitted, starts from method entry.",
+                        "description": "Optional specific CFG node ID to start from. If omitted, starts from target entry.",
                     },
                     "target_node_id": {
                         "type": "integer",
@@ -90,7 +97,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                         "description": "Maximum number of execution paths to return (default: 3).",
                     },
                 },
-                "required": ["method_name"],
             },
         },
     },
@@ -106,9 +112,13 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                    },
                     "method_name": {
                         "type": "string",
-                        "description": "Name or substring of the method containing the variable (e.g. 'apply_discount').",
+                        "description": "Optional legacy alias for target method name.",
                     },
                     "var_name": {
                         "type": "string",
@@ -123,7 +133,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                         "description": "Maximum number of data flow steps to follow (default: 15).",
                     },
                 },
-                "required": ["method_name"],
             },
         },
     },
@@ -139,9 +148,13 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID (e.g. '107374182415'), qualified name ('InventoryManager.apply_discount'), or method name.",
+                    },
                     "method_name": {
                         "type": "string",
-                        "description": "Name or substring of the method containing the variable (e.g. 'apply_discount' or 'generate_category_summary').",
+                        "description": "Optional legacy alias for target method name.",
                     },
                     "var_name": {
                         "type": "string",
@@ -152,7 +165,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                         "description": "Optional specific starting node ID. If omitted, automatically resolves variable origin.",
                     },
                 },
-                "required": ["method_name"],
             },
         },
     },
@@ -163,21 +175,70 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 # 2. Tool Execution Dispatcher
 # ==============================================================================
 
-def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[int]:
-    """Finds the most specific METHOD node matching method_name, prioritizing real implementation bodies over compiler adapters."""
-    nodes = find_nodes(graph, label="METHOD", code_contains=method_name)
-    if not nodes:
-        nodes = find_nodes(graph, label="METHOD", name=method_name)
+def resolve_target_node(graph: nx.MultiDiGraph, target: Any) -> Optional[int]:
+    """Dynamically resolves a target to a CPG node ID.
+
+    Supports:
+      1. Direct integer node ID: 107374182415 or '#107374182415'
+      2. Qualified names: 'InventoryManager.apply_discount' or 'TestInventoryManager.test_apply_discount'
+      3. Simple method/symbol names: 'apply_discount'
+    Prioritizes real implementation bodies over compiler adapters (<metaClassAdapter>).
+    """
+    if target is None:
+        return None
+
+    # Case 1: Numeric ID
+    if isinstance(target, int):
+        return target if target in graph else None
+    target_str = str(target).strip()
+    clean_id = target_str.lstrip("#")
+    if clean_id.isdigit():
+        nid = int(clean_id)
+        if nid in graph:
+            return nid
+
+    # Case 2: Dot-separated qualified name e.g. InventoryManager.apply_discount
+    if "." in target_str:
+        parts = target_str.split(".")
+        meth_part = parts[-1].strip()
+        cls_part = parts[-2].strip().lower() if len(parts) > 1 else ""
+        candidates = find_nodes(graph, label="METHOD", code_contains=meth_part)
+        filtered = []
+        for c in candidates:
+            matched = False
+            for p, _, ed in graph.in_edges(c, data=True):
+                if ed.get("label") == "AST":
+                    pdata = graph.nodes[p]
+                    if cls_part and cls_part in str(pdata.get("code", "")).lower():
+                        matched = True
+                        break
+                    elif pdata.get("code") == "<body>":
+                        for pp, _, eed in graph.in_edges(p, data=True):
+                            if eed.get("label") == "AST" and cls_part in str(graph.nodes[pp].get("code", "")).lower():
+                                matched = True
+                                break
+            if matched or not cls_part:
+                filtered.append(c)
+        candidates = filtered if filtered else candidates
+    else:
+        candidates = find_nodes(graph, label="METHOD", code_contains=target_str)
+        if not candidates:
+            candidates = find_nodes(graph, label="METHOD", name=target_str)
 
     # Filter out compiler-generated adapter wrappers (<metaClassAdapter>)
     real_nodes = [
-        n for n in nodes
+        n for n in candidates
         if "<metaClassAdapter>" not in str(graph.nodes[n].get("code", ""))
         and "<metaClassAdapter>" not in str(graph.nodes[n].get("name", ""))
     ]
     if real_nodes:
         return real_nodes[0]
-    return nodes[0] if nodes else None
+    return candidates[0] if candidates else None
+
+
+def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[int]:
+    """Backward compatible wrapper around resolve_target_node."""
+    return resolve_target_node(graph, method_name)
 
 
 class ToolMemoryBuffer:
@@ -198,13 +259,13 @@ class ToolMemoryBuffer:
 
         Returns an interception error message if repeated, or None if new.
         """
-        method_name = str(arguments.get("method_name", "")).strip().lower()
+        target_str = str(arguments.get("target") or arguments.get("method_name") or "").strip().lower()
         var_name = str(arguments.get("var_name", "")).strip().lower()
         node_id_arg = arguments.get("node_id") or arguments.get("start_node_id") or arguments.get("source_node_id")
 
         canonical_sig = (
             tool_name,
-            method_name,
+            target_str,
             var_name,
             str(node_id_arg or ""),
             str(arguments.get("filter_labels") or ""),
@@ -245,11 +306,18 @@ def dispatch_tool(
     memory: Optional[ToolMemoryBuffer] = None,
 ) -> Dict[str, Any]:
     """Executes a requested tool call against the loaded NetworkX CPG graph."""
-    method_name = arguments.get("method_name", "").strip()
-    method_id = resolve_method_node(graph, method_name) if method_name else None
+    target_arg = (
+        arguments.get("target")
+        or arguments.get("method_name")
+        or arguments.get("node_id")
+        or arguments.get("start_node_id")
+        or arguments.get("source_node_id")
+    )
+    method_id = resolve_target_node(graph, target_arg) if target_arg is not None else None
+    target_display = str(target_arg or "")
 
     # Handle wildcards, class names, or missing methods gracefully by listing methods
-    if method_name in ("*", "all", "list", "") or (method_name and method_id is None):
+    if target_display in ("*", "all", "list", "") or (target_display and method_id is None):
         all_methods = []
         seen = set()
         for n in find_nodes(graph, label="METHOD"):
@@ -265,19 +333,19 @@ def dispatch_tool(
 
         matching = [
             m for m in all_methods
-            if method_name == "*" or method_name.lower() in str(m["name"]).lower()
+            if target_display == "*" or target_display.lower() in str(m["name"]).lower()
         ]
         if matching and len(matching) == 1:
             method_id = matching[0]["node_id"]
         elif matching:
             return {
-                "info": f"Found {len(matching)} methods related to '{method_name}':",
+                "info": f"Found {len(matching)} methods related to '{target_display}':",
                 "available_methods": [m["name"] for m in matching[:15]],
-                "hint": "Please call the tool specifying one of the method names listed above.",
+                "hint": "Please call the tool specifying one of the method names or node IDs listed above.",
             }
         else:
             return {
-                "error": f"Method or class '{method_name}' was not found in the Code Property Graph.",
+                "error": f"Method or class '{target_display}' was not found in the Code Property Graph.",
                 "available_methods": [m["name"] for m in all_methods[:15]],
                 "suggestion": "Select one of the available methods listed above.",
             }
@@ -307,9 +375,11 @@ def dispatch_tool(
                 }
                 for n in nodes[:25]
             ]
+            resolved_desc = get_node_label_summary(graph, root_id) if root_id in graph else None
             return {
                 "tool": "traverse_ast",
-                "method": method_name,
+                "target": target_display,
+                "resolved_target": resolved_desc,
                 "root_node_id": root_id,
                 "total_nodes_found": len(nodes),
                 "ast_nodes": compact_nodes,
@@ -330,9 +400,11 @@ def dispatch_tool(
                     steps.append(f"... ({len(p) - 12} more steps)")
                 formatted_paths.append({"path_index": idx, "length": len(p), "steps": steps})
 
+            resolved_desc = get_node_label_summary(graph, start_id) if start_id in graph else None
             return {
                 "tool": "traverse_cfg",
-                "method": method_name,
+                "target": target_display,
+                "resolved_target": resolved_desc,
                 "start_node_id": start_id,
                 "paths_count": len(paths),
                 "execution_paths": formatted_paths,
@@ -375,9 +447,11 @@ def dispatch_tool(
                 ]
                 formatted_traces.append({"trace_index": idx, "steps": steps})
 
+            resolved_desc = get_node_label_summary(graph, source_id) if source_id in graph else None
             return {
                 "tool": "traverse_data_flow",
-                "method": method_name,
+                "target": target_display,
+                "resolved_target": resolved_desc,
                 "source_node_id": source_id,
                 "tracked_variable": var_name,
                 "traces_found": len(traces),
@@ -386,16 +460,18 @@ def dispatch_tool(
 
         elif tool_name == "trace_variable_to_sink":
             var_name = arguments.get("var_name")
-            start_id = arguments.get("start_node_id")
+            start_id = arguments.get("start_node_id") or method_id
             result = trace_variable_to_sink(
                 graph,
                 start_node_id=start_id,
-                method_name=method_name,
+                method_name=target_display if not method_id else None,
                 var_name=var_name,
             )
+            resolved_desc = get_node_label_summary(graph, method_id) if method_id in graph else None
             return {
                 "tool": "trace_variable_to_sink",
-                "method": method_name,
+                "target": target_display,
+                "resolved_target": resolved_desc,
                 "variable": result.get("variable"),
                 "origin": result.get("origin"),
                 "terminal_sink": result.get("terminal_sink"),

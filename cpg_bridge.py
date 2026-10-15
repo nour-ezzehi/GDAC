@@ -431,6 +431,24 @@ def trace_variable_to_sink(
         else:
             start_node_id = target_m
 
+    # If start_node_id points to a METHOD node and var_name is provided, anchor to the variable's origin inside that method
+    if start_node_id in graph and graph.nodes[start_node_id].get("label") == "METHOD" and var_name:
+        ast_edges = [(u, v) for u, v, d in graph.edges(data=True) if d.get("label") == "AST"]
+        ast_digraph = nx.DiGraph(ast_edges)
+        ast_desc = nx.descendants(ast_digraph, start_node_id) if start_node_id in ast_digraph else set()
+        ast_desc.add(start_node_id)
+
+        var_nodes = [n for n in find_nodes(graph, code_contains=var_name) if n in ast_desc]
+        param_nodes = [n for n in var_nodes if graph.nodes[n].get("label") == "PARAM"]
+        assign_nodes = [n for n in var_nodes if "assignment" in str(graph.nodes[n].get("label", ""))]
+
+        if param_nodes:
+            start_node_id = param_nodes[0]
+        elif assign_nodes:
+            start_node_id = assign_nodes[0]
+        elif var_nodes:
+            start_node_id = var_nodes[0]
+
     if start_node_id not in graph:
         raise ValueError(f"Start node #{start_node_id} not found in graph.")
 
