@@ -20,6 +20,16 @@ from agent_tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
 from cpg_bridge import load_cpg_json
 from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 
+try:
+    from agent_langchain import (
+        LocalHuggingFaceChatModel,
+        MockGoTChatModel,
+        run_langgraph_agent_loop,
+    )
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+
 
 # ==============================================================================
 # 1. Model Deployment (4-bit & 8-bit Quantization)
@@ -339,6 +349,13 @@ def main() -> None:
         help="Quantization level (default: 4bit)",
     )
     parser.add_argument(
+        "--framework",
+        type=str,
+        default="langchain" if LANGCHAIN_AVAILABLE else "native",
+        choices=["langchain", "native"],
+        help="Agent framework: 'langchain' (LangGraph stateful agent) or 'native' (original raw loop).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run local simulation without loading PyTorch LLM weights (useful for verifying flow)",
@@ -363,7 +380,22 @@ def main() -> None:
     print(f"[+] Loaded Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges.")
 
     if args.dry_run or "--dry-run" in sys.argv:
-        run_mock_agent(graph, problem_type=args.target)
+        if args.framework == "langchain" and LANGCHAIN_AVAILABLE:
+            failing_test = (
+                "FAILED tests/test_inventory.py::TestInventoryManager::test_apply_discount\n"
+                "AssertionError: 20.0 != 80.0\n"
+                "Notes: Applying a 20% discount on $100 resulted in $20.00 instead of $80.00."
+                if args.target == "discount"
+                else (
+                    "FAILED tests/test_reports.py::TestInventoryReporter::test_generate_category_summary_aggregates_multiple_items\n"
+                    "AssertionError: 250.0 != 1000.0\n"
+                    "Notes: Total category value only shows the last item's value ($250) instead of sum ($1000)."
+                )
+            )
+            mock_llm = MockGoTChatModel(problem_type=args.target)
+            run_langgraph_agent_loop(mock_llm, graph, failing_test, max_turns=4)
+        else:
+            run_mock_agent(graph, problem_type=args.target)
         return
 
     # Real LLM execution (for Colab / GPU environment)
@@ -381,7 +413,14 @@ def main() -> None:
         bug_description="The inventory discount operation fails its unit test.",
     )
 
-    run_agent_loop(model, tokenizer, graph, sample_problem)
+    if args.framework == "langchain":
+        if not LANGCHAIN_AVAILABLE:
+            print("[-] LangChain is not installed. Install via: pip install langchain langgraph pydantic", file=sys.stderr)
+            sys.exit(1)
+        langchain_chat = LocalHuggingFaceChatModel(model=model, tokenizer=tokenizer)
+        run_langgraph_agent_loop(langchain_chat, graph, sample_problem)
+    else:
+        run_agent_loop(model, tokenizer, graph, sample_problem)
 
 
 if __name__ == "__main__":
