@@ -9,6 +9,10 @@ dispatcher to invoke them on a loaded NetworkX MultiDiGraph.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import re
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 import networkx as nx
 
@@ -20,6 +24,7 @@ from cpg_bridge import (
     traverse_cfg,
     traverse_data_flow,
 )
+from cpg_condenser import condense_method_slice
 
 
 # ==============================================================================
@@ -168,11 +173,78 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "condense_method_slice",
+            "description": (
+                "Program Slicer & Condenser: Computes the backward and forward slice of `target_vars` inside a method "
+                "using REACHING_DEF/DDG and CFG edges, folding non-causal statement blocks into single-line "
+                "`# [condensed block: N statements]` markers within `token_budget`, and returns the method's "
+                "data-flow summary (reads, writes, calls)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID, qualified name ('ClassName.method_name'), or method name.",
+                    },
+                    "target_vars": {
+                        "type": "string",
+                        "description": "Variable name or comma-separated list of variable names to slice on (e.g. 'discount_percent' or 'item_total,summary').",
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Maximum token budget for the condensed slice (default: 200).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_patch",
+            "description": (
+                "Blind-Locate, Surgical-Patch (BLSP) Verifier: Materializes the 15-line source window around "
+                "(target, line_number), applies a surgical old_string -> new_string replacement on disk, "
+                "executes pytest via subprocess, and returns status='SOLVED' (returncode 0) or parses the "
+                "new AssertionError traceback and implicated variables for re-slicing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Universal anchor: exact integer Node ID, qualified name ('ClassName.method_name'), or method name.",
+                    },
+                    "line_number": {
+                        "type": "integer",
+                        "description": "Target 1-indexed line number identified during condense_method_slice inspection.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact existing line or statement block to replace within the 15-line materialized window.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement line or statement block that fixes the bug.",
+                    },
+                    "test_path": {
+                        "type": "string",
+                        "description": "Optional pytest path (default: automatically resolves the corresponding test file under stackflow/tests/).",
+                    },
+                },
+                "required": ["target", "line_number", "old_string", "new_string"],
+            },
+        },
+    },
 ]
 
 
 # ==============================================================================
-# 2. Tool Execution Dispatcher
+# 2. Tool Execution Dispatcher & BLSP Runtime Verifier
 # ==============================================================================
 
 def resolve_target_node(graph: nx.MultiDiGraph, target: Any) -> Optional[int]:
@@ -241,6 +313,402 @@ def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[in
     return resolve_target_node(graph, method_name)
 
 
+def resolve_method_source_file(
+    graph: nx.MultiDiGraph,
+    method_id: int,
+    repo_root: str | Path = "stackflow",
+) -> Optional[Path]:
+    """Resolves a CPG METHOD node to its physical source file on disk.
+
+    Because Joern CPG exports may omit explicit filename attributes on AST nodes,
+    this function checks node attributes first and falls back to matching the
+    method's name, enclosing TYPE_DECL class name, and definition line number
+    against repository source files under `repo_root`.
+    """
+    base_dir = Path(repo_root)
+    if not base_dir.is_absolute():
+        project_root = Path(__file__).resolve().parent
+        base_dir = project_root / base_dir
+
+    if method_id not in graph:
+        return None
+
+    node_data = graph.nodes[method_id]
+    # 1. Direct filename attribute if present
+    for key in ("filename", "file", "filepath"):
+        fname = node_data.get(key)
+        if fname and fname != "empty":
+            cand = base_dir / str(fname)
+            if cand.is_file():
+                return cand
+            cand2 = base_dir.parent / str(fname)
+            if cand2.is_file():
+                return cand2
+
+    # 2. Match method name, parent class, and line number in repo_root
+    method_name = str(node_data.get("name") or node_data.get("code") or "").strip()
+    if "." in method_name:
+        method_name = method_name.split(".")[-1].strip()
+    m_line = node_data.get("line_number")
+
+    parent_class = None
+    for p, _, ed in graph.in_edges(method_id, data=True):
+        if ed.get("label") == "AST":
+            pdata = graph.nodes[p]
+            pcode = str(pdata.get("code") or pdata.get("name") or "")
+            if pdata.get("label") == "TYPE_DECL" and not pcode.endswith("<metaClassAdapter>"):
+                parent_class = pcode
+                break
+            elif pcode == "<body>":
+                for pp, _, eed in graph.in_edges(p, data=True):
+                    if eed.get("label") == "AST" and graph.nodes[pp].get("label") == "TYPE_DECL":
+                        ppcode = str(graph.nodes[pp].get("code") or graph.nodes[pp].get("name") or "")
+                        if not ppcode.endswith("<metaClassAdapter>"):
+                            parent_class = ppcode
+                            break
+
+    if not base_dir.exists():
+        return None
+
+    py_files = sorted(base_dir.rglob("*.py"))
+    best_file: Optional[Path] = None
+    best_score = -1
+
+    def_pattern = re.compile(rf"^\s*def\s+{re.escape(method_name)}\s*\(") if method_name else None
+    cls_pattern = re.compile(rf"^\s*class\s+{re.escape(parent_class)}\b") if parent_class else None
+
+    for py_file in py_files:
+        try:
+            lines = py_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+
+        score = 0
+        has_class = False
+        if cls_pattern:
+            has_class = any(cls_pattern.search(line) for line in lines)
+            if has_class:
+                score += 10
+
+        for idx, line in enumerate(lines, start=1):
+            if def_pattern and def_pattern.search(line):
+                curr_score = score + 20
+                if isinstance(m_line, int):
+                    dist = abs(idx - m_line)
+                    if dist == 0:
+                        curr_score += 50
+                    elif dist <= 5:
+                        curr_score += max(0, 30 - dist * 5)
+                if curr_score > best_score:
+                    best_score = curr_score
+                    best_file = py_file
+
+    return best_file
+
+
+def materialize_source_window(
+    file_path: Path,
+    line_number: int,
+    window_size: int = 15,
+) -> Dict[str, Any]:
+    """Extracts ONLY the surrounding `window_size` lines (default 15: +/- 7 lines) from disk."""
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    total_lines = len(lines)
+    half = window_size // 2
+    center = max(1, min(int(line_number), total_lines))
+    start_line = max(1, center - half)
+    end_line = min(total_lines, start_line + window_size - 1)
+    if end_line - start_line + 1 < window_size:
+        start_line = max(1, end_line - window_size + 1)
+
+    window_lines = lines[start_line - 1 : end_line]
+    numbered_window = "\n".join(
+        f"L{ln}: {text}" for ln, text in zip(range(start_line, end_line + 1), window_lines)
+    )
+    raw_window = "\n".join(window_lines)
+    return {
+        "file_path": str(file_path),
+        "start_line": start_line,
+        "end_line": end_line,
+        "target_line": center,
+        "raw_window": raw_window,
+        "numbered_window": numbered_window,
+        "window_lines": window_lines,
+    }
+
+
+def _normalize_expr_for_match(expr: str) -> str:
+    """Normalizes whitespace and redundant grouping parentheses for CPG-to-disk matching."""
+    return re.sub(r"[\s()]+", "", expr.strip())
+
+
+def _extract_implicated_variables(
+    traceback_text: str,
+    graph: Optional[nx.MultiDiGraph] = None,
+    method_id: Optional[int] = None,
+) -> List[str]:
+    """Extracts newly implicated variables from a pytest AssertionError / traceback."""
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    # Check method reads/writes from condensed CPG summary if available
+    method_vars: Set[str] = set()
+    if graph is not None and method_id is not None and method_id in graph:
+        summary = graph.nodes[method_id].get("data_flow_summary", {})
+        for v in summary.get("writes", []) + summary.get("reads", []):
+            method_vars.add(str(v))
+
+    # Extract identifiers from E / assert / traceback code lines
+    important_lines = [
+        line for line in traceback_text.splitlines()
+        if line.strip().startswith(("E ", "> ", "assert ")) or "AssertionError" in line
+    ]
+    search_blob = "\n".join(important_lines) if important_lines else traceback_text
+
+    # Match dotted attributes and identifiers (e.g. item.price, summary, discount_percent)
+    var_Regex = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b")
+    stop_words = {
+        "assert", "AssertionError", "def", "return", "in", "is", "not", "and", "or",
+        "True", "False", "None", "self", "pytest", "approx", "test", "where", "float",
+        "int", "str", "round", "len", "get", "Exception", "Error", "FAILED", " E",
+    }
+
+    # First prioritize variables known in the method's data_flow_summary
+    for mv in sorted(method_vars):
+        base_mv = mv.split(".")[-1]
+        if mv in traceback_text or base_mv in traceback_text:
+            if mv not in seen:
+                seen.add(mv)
+                candidates.append(mv)
+
+    for m in var_Regex.finditer(search_blob):
+        tok = m.group(1)
+        if tok in stop_words or tok.startswith("test_") or tok.startswith("Test"):
+            continue
+        if "." in tok:
+            lhs, rhs = tok.split(".", 1)
+            if lhs in stop_words or rhs in ("py", "approx", "get"):
+                continue
+        if tok not in seen:
+            seen.add(tok)
+            candidates.append(tok)
+
+    # Also ensure all method writes are included if fallback needed
+    if graph is not None and method_id is not None and method_id in graph:
+        summary = graph.nodes[method_id].get("data_flow_summary", {})
+        for w in summary.get("writes", []):
+            if w not in seen:
+                seen.add(w)
+                candidates.append(w)
+
+    return candidates[:6]
+
+
+def verify_patch(
+    graph: nx.MultiDiGraph,
+    target: Any,
+    line_number: int,
+    old_string: str,
+    new_string: str,
+    test_path: Optional[str] = None,
+    repo_root: str | Path = "stackflow",
+    keep_patch: bool = False,
+) -> Dict[str, Any]:
+    """Executes the Blind-Locate, Surgical-Patch (BLSP) verification sequence.
+
+    1. Context Materialization: Resolves `(target, line_number)` to its physical file
+       and extracts ONLY the surrounding 15 lines (+/- 7 lines) from disk.
+    2. Surgical Diff: Replaces `old_string -> new_string` within the localized window
+       (handling indentation and Joern CPG parenthesis normalization cleanly).
+    3. Subprocess Execution: Runs `pytest` via `subprocess.run()`.
+    4. Feedback Routing:
+       - If `returncode == 0`, returns `status="SOLVED"`.
+       - If `returncode != 0`, rolls back the failed edit, parses the new
+         `AssertionError` / traceback, extracts `implicated_variables`, and returns
+         `status="FAILED"` to route the agent back to `condense_method_slice`.
+    """
+    method_id = resolve_target_node(graph, target)
+    if method_id is None:
+        return {
+            "tool": "verify_patch",
+            "status": "ERROR",
+            "error": f"Could not resolve target method '{target}' in CPG.",
+        }
+
+    file_path = resolve_method_source_file(graph, method_id, repo_root=repo_root)
+    if file_path is None or not file_path.is_file():
+        return {
+            "tool": "verify_patch",
+            "status": "ERROR",
+            "error": f"Could not resolve physical source file for method '{target}' (#{method_id}).",
+        }
+
+    # Step 1: Context Materialization (15-line window around line_number)
+    window_info = materialize_source_window(file_path, line_number, window_size=15)
+    original_content = file_path.read_text(encoding="utf-8")
+    all_lines = original_content.splitlines()
+
+    old_clean = (old_string or "").strip()
+    new_clean = (new_string or "").strip()
+    if not old_clean or not new_clean:
+        return {
+            "tool": "verify_patch",
+            "status": "MATERIALIZED",
+            "target": str(target),
+            "method_id": method_id,
+            "file_path": str(file_path),
+            "line_number": line_number,
+            "materialized_window": window_info["numbered_window"],
+            "hint": "Provide non-empty old_string and new_string from the 15-line materialized window.",
+        }
+
+    # Step 2: Surgical Diff within the 15-line materialized window
+    w_start = window_info["start_line"]
+    w_end = window_info["end_line"]
+    patched_content: Optional[str] = None
+    applied_line: Optional[int] = None
+
+    # 2a. Exact multi-line or single-line match within the window slice
+    window_text = "\n".join(all_lines[w_start - 1 : w_end])
+    if old_string in window_text:
+        replaced_window = window_text.replace(old_string, new_string, 1)
+        new_all_lines = (
+            all_lines[: w_start - 1]
+            + replaced_window.splitlines()
+            + all_lines[w_end:]
+        )
+        patched_content = "\n".join(new_all_lines) + ("\n" if original_content.endswith("\n") else "")
+        applied_line = line_number
+    else:
+        # 2b. Line-by-line match inside the 15-line window (preserving indentation)
+        # Prioritizes line_number first, then scans the 15-line window
+        candidate_indices = [line_number - 1] + [
+            i for i in range(w_start - 1, w_end) if i != line_number - 1
+        ]
+        norm_old = _normalize_expr_for_match(old_clean)
+        for idx in candidate_indices:
+            if 0 <= idx < len(all_lines):
+                disk_line = all_lines[idx]
+                disk_stripped = disk_line.strip()
+                if not disk_stripped or disk_stripped.startswith("#"):
+                    continue
+                if disk_stripped == old_clean or _normalize_expr_for_match(disk_stripped) == norm_old:
+                    indent = disk_line[: len(disk_line) - len(disk_line.lstrip())]
+                    replacement_lines = [
+                        (indent + nl.lstrip()) if nl.strip() else ""
+                        for nl in new_clean.splitlines()
+                    ]
+                    new_all_lines = (
+                        all_lines[:idx] + replacement_lines + all_lines[idx + 1 :]
+                    )
+                    patched_content = "\n".join(new_all_lines) + (
+                        "\n" if original_content.endswith("\n") else ""
+                    )
+                    applied_line = idx + 1
+                    break
+
+    if patched_content is None:
+        return {
+            "tool": "verify_patch",
+            "status": "FAILED",
+            "returncode": -1,
+            "target": str(target),
+            "method_id": method_id,
+            "file_path": str(file_path),
+            "line_number": line_number,
+            "materialized_window": window_info["numbered_window"],
+            "error": (
+                f"Surgical replacement failed: `old_string` ({old_clean!r}) did not match any line "
+                f"in the 15-line window (L{w_start}-L{w_end}). Inspect `materialized_window` and retry."
+            ),
+            "implicated_variables": _extract_implicated_variables(old_clean, graph, method_id),
+        }
+
+    # Resolve pytest target path
+    project_root = Path(__file__).resolve().parent
+    if test_path:
+        resolved_test = Path(test_path)
+        if not resolved_test.is_absolute():
+            resolved_test = project_root / resolved_test
+    else:
+        module_test = file_path.parent.parent / "tests" / f"test_{file_path.stem}.py"
+        if module_test.is_file():
+            resolved_test = module_test
+        else:
+            resolved_test = file_path.parent.parent / "tests"
+
+    # Step 3: Subprocess Execution with atomic rollback guarantee
+    returncode = 1
+    stdout_text = ""
+    stderr_text = ""
+    try:
+        file_path.write_text(patched_content, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(resolved_test), "-v", "--tb=short"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        returncode = proc.returncode
+        stdout_text = proc.stdout
+        stderr_text = proc.stderr
+    finally:
+        if returncode != 0 or not keep_patch:
+            file_path.write_text(original_content, encoding="utf-8")
+
+    combined_output = (stdout_text + "\n" + stderr_text).strip()
+
+    # Step 4: Feedback Routing
+    if returncode == 0:
+        return {
+            "tool": "verify_patch",
+            "status": "SOLVED",
+            "returncode": 0,
+            "target": str(target),
+            "method_id": method_id,
+            "file_path": str(file_path),
+            "applied_line": applied_line,
+            "old_string": old_clean,
+            "new_string": new_clean,
+            "materialized_window": window_info["numbered_window"],
+            "test_target": str(resolved_test),
+            "pytest_output": combined_output,
+        }
+
+    # Extract concise AssertionError / failure block
+    failure_lines = []
+    capture = False
+    for line in combined_output.splitlines():
+        if line.startswith("___") or line.startswith("E   ") or "AssertionError" in line or "FAILED" in line:
+            capture = True
+        if capture:
+            failure_lines.append(line)
+    parsed_traceback = "\n".join(failure_lines[-25:]) if failure_lines else combined_output[-1000:]
+    implicated_vars = _extract_implicated_variables(parsed_traceback, graph, method_id)
+
+    return {
+        "tool": "verify_patch",
+        "status": "FAILED",
+        "returncode": returncode,
+        "target": str(target),
+        "method_id": method_id,
+        "file_path": str(file_path),
+        "applied_line": applied_line,
+        "old_string": old_clean,
+        "new_string": new_clean,
+        "materialized_window": window_info["numbered_window"],
+        "test_target": str(resolved_test),
+        "traceback": parsed_traceback,
+        "implicated_variables": implicated_vars,
+        "feedback_directive": (
+            f"Patch verification FAILED (returncode={returncode}). "
+            f"Loop back and call `condense_method_slice` on `{target}` targeting "
+            f"implicated variables {implicated_vars} to inspect the causal chain before retrying `verify_patch`."
+        ),
+    }
+
+
 class ToolMemoryBuffer:
     """Deterministic stateful memory buffer preventing repetitive tool invocation loops."""
 
@@ -260,8 +728,18 @@ class ToolMemoryBuffer:
         Returns an interception error message if repeated, or None if new.
         """
         target_str = str(arguments.get("target") or arguments.get("method_name") or "").strip().lower()
-        var_name = str(arguments.get("var_name", "")).strip().lower()
-        node_id_arg = arguments.get("node_id") or arguments.get("start_node_id") or arguments.get("source_node_id")
+        var_name = str(
+            arguments.get("var_name")
+            or arguments.get("target_vars")
+            or arguments.get("new_string")
+            or ""
+        ).strip().lower()
+        node_id_arg = (
+            arguments.get("node_id")
+            or arguments.get("start_node_id")
+            or arguments.get("source_node_id")
+            or arguments.get("line_number")
+        )
 
         canonical_sig = (
             tool_name,
@@ -376,7 +854,7 @@ def dispatch_tool(
                 for n in nodes[:25]
             ]
             resolved_desc = get_node_label_summary(graph, root_id) if root_id in graph else None
-            return {
+            out_dict: Dict[str, Any] = {
                 "tool": "traverse_ast",
                 "target": target_display,
                 "resolved_target": resolved_desc,
@@ -384,6 +862,9 @@ def dispatch_tool(
                 "total_nodes_found": len(nodes),
                 "ast_nodes": compact_nodes,
             }
+            if root_id in graph and "data_flow_summary" in graph.nodes[root_id]:
+                out_dict["data_flow_summary"] = graph.nodes[root_id]["data_flow_summary"]
+            return out_dict
 
         elif tool_name == "traverse_cfg":
             start_id = arguments.get("start_node_id") or method_id
@@ -479,6 +960,42 @@ def dispatch_tool(
                 "summary": result.get("summary"),
                 "propagation_path": result.get("detailed_path"),
             }
+
+        elif tool_name == "condense_method_slice":
+            target_vars_arg = arguments.get("target_vars") or arguments.get("var_name") or ""
+            token_budget = int(arguments.get("token_budget", 200))
+            slice_res = condense_method_slice(
+                graph,
+                method_id=method_id if method_id is not None else target_display,
+                target_vars=target_vars_arg,
+                token_budget=token_budget,
+            )
+            return {
+                "tool": "condense_method_slice",
+                "target": target_display,
+                "method_id": slice_res["method_id"],
+                "target_vars": slice_res["target_vars"],
+                "method_summary": slice_res["method_summary"],
+                "slice_text": slice_res["slice_text"],
+                "interprocedural_links": slice_res.get("interprocedural_links", []),
+                "token_stats": slice_res["token_stats"],
+            }
+
+        elif tool_name == "verify_patch":
+            line_number = int(arguments.get("line_number", 1))
+            old_string = str(arguments.get("old_string", ""))
+            new_string = str(arguments.get("new_string", ""))
+            test_path = arguments.get("test_path")
+            keep_patch = bool(arguments.get("keep_patch", False))
+            return verify_patch(
+                graph,
+                target=method_id if method_id is not None else target_display,
+                line_number=line_number,
+                old_string=old_string,
+                new_string=new_string,
+                test_path=test_path,
+                keep_patch=keep_patch,
+            )
 
         else:
             return {"error": f"Unknown tool: '{tool_name}'"}

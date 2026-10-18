@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
 from agent_tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
 from cpg_bridge import load_cpg_json
+from cpg_condenser import condense_cpg, condense_method_slice
 from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 
 try:
@@ -272,8 +273,15 @@ def run_mock_agent(graph: Any, problem_type: str = "discount") -> None:
     dup_res = dispatch_tool(graph, "traverse_ast", {"method_name": target_method, "max_depth": 3})
     print(f"Interceptor Response: {dup_res}")
 
-    # Step 4: Macro-Tool Algorithmic Offloading
-    print(f"\n--- [GoT Node 4: Macro-Tool Data Flow Offloading (trace_variable_to_sink)] ---")
+    # Step 4: Program Slicing & Macro-Tool Algorithmic Offloading
+    print(f"\n--- [GoT Node 4: Program Slicing (`condense_method_slice`) & Macro-Tool (`trace_variable_to_sink`)] ---")
+    slice_res = dispatch_tool(
+        graph, "condense_method_slice", {"target": target_method, "target_vars": target_var, "token_budget": 120}
+    )
+    print(f"Tool Call: condense_method_slice(target='{target_method}', target_vars='{target_var}')")
+    print(f"[Data-Flow Summary]: {slice_res.get('method_summary')}")
+    print(f"[Condensed Slice ({slice_res.get('token_stats', {}).get('used_tokens')} tokens)]:\n{slice_res.get('slice_text')}\n")
+
     macro_res = dispatch_tool(
         graph, "trace_variable_to_sink", {"method_name": target_method, "var_name": target_var}
     )
@@ -356,6 +364,11 @@ def main() -> None:
         help="Agent framework: 'langchain' (LangGraph stateful agent) or 'native' (original raw loop).",
     )
     parser.add_argument(
+        "--no-condense",
+        action="store_true",
+        help="Disable CPG statement-level condensation and use the raw sub-expression CPG.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run local simulation without loading PyTorch LLM weights (useful for verifying flow)",
@@ -376,8 +389,17 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[*] Loading CPG graph from '{cpg_path}'...")
-    graph = load_cpg_json(cpg_path)
-    print(f"[+] Loaded Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges.")
+    raw_graph = load_cpg_json(cpg_path)
+    print(f"[+] Loaded Raw Graph: {raw_graph.number_of_nodes()} nodes, {raw_graph.number_of_edges()} edges.")
+
+    if args.no_condense:
+        graph = raw_graph
+    else:
+        graph = condense_cpg(raw_graph)
+        print(
+            f"[+] Condensed CPG (Statement-Level): {graph.number_of_nodes()} nodes, "
+            f"{graph.number_of_edges()} edges."
+        )
 
     if args.dry_run or "--dry-run" in sys.argv:
         if args.framework == "langchain" and LANGCHAIN_AVAILABLE:

@@ -118,6 +118,46 @@ class SemanticSearchInput(BaseModel):
     )
 
 
+class CondenseMethodSliceInput(BaseModel):
+    """Input schema for program slicing and non-causal block folding."""
+    target: str = Field(
+        ...,
+        description="Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
+    )
+    target_vars: str | List[str] = Field(
+        ...,
+        description="Variable name, list of variable names, or comma-separated list of variable names to slice on (e.g. 'discount_percent' or ['discount_percent', 'new_price']).",
+    )
+    token_budget: int = Field(
+        200,
+        description="Maximum token budget for the condensed slice (default: 200).",
+    )
+
+
+class VerifyPatchInput(BaseModel):
+    """Input schema for Blind-Locate, Surgical-Patch (BLSP) runtime verification."""
+    target: str = Field(
+        ...,
+        description="Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
+    )
+    line_number: int = Field(
+        ...,
+        description="Target 1-indexed line number identified during condense_method_slice inspection.",
+    )
+    old_string: str = Field(
+        ...,
+        description="Exact existing statement or line to replace within the 15-line materialized source window.",
+    )
+    new_string: str = Field(
+        ...,
+        description="Replacement statement or line that fixes the bug.",
+    )
+    test_path: Optional[str] = Field(
+        None,
+        description="Optional pytest target path (default: automatically resolves the corresponding test file under stackflow/tests/).",
+    )
+
+
 # ==============================================================================
 # 2. LangChain Tool Builder
 # ==============================================================================
@@ -126,7 +166,7 @@ def create_cpg_langchain_tools(
     graph: nx.MultiDiGraph,
     memory: Optional[ToolMemoryBuffer] = None,
 ) -> List[Any]:
-    """Instantiates and returns the 5 LangChain StructuredTools bound to the given CPG graph."""
+    """Instantiates and returns the 7 LangChain StructuredTools bound to the given CPG graph."""
     if StructuredTool is None:
         raise ImportError(
             "LangChain is not installed. Run: pip install langchain langchain-core"
@@ -206,6 +246,44 @@ def create_cpg_langchain_tools(
         )
         return json.dumps(res, indent=2)
 
+    def _condense_method_slice(
+        target: str,
+        target_vars: str | List[str],
+        token_budget: int = 200,
+    ) -> str:
+        res = dispatch_tool(
+            graph,
+            "condense_method_slice",
+            {
+                "target": target,
+                "target_vars": target_vars,
+                "token_budget": token_budget,
+            },
+            memory=memory,
+        )
+        return json.dumps(res, indent=2)
+
+    def _verify_patch(
+        target: str,
+        line_number: int,
+        old_string: str,
+        new_string: str,
+        test_path: Optional[str] = None,
+    ) -> str:
+        res = dispatch_tool(
+            graph,
+            "verify_patch",
+            {
+                "target": target,
+                "line_number": line_number,
+                "old_string": old_string,
+                "new_string": new_string,
+                "test_path": test_path,
+            },
+            memory=memory,
+        )
+        return json.dumps(res, indent=2)
+
     def _semantic_code_search(query: str, top_k: int = 3) -> str:
         results = find_semantic_entry_points(graph, query, top_k=top_k)
         formatted = []
@@ -260,6 +338,30 @@ def create_cpg_langchain_tools(
         args_schema=TraceVariableToSinkInput,
     )
 
+    tool_slice = StructuredTool.from_function(
+        func=_condense_method_slice,
+        name="condense_method_slice",
+        description=(
+            "Program Slicer & Condenser: Computes the backward and forward slice of `target_vars` inside a method "
+            "using REACHING_DEF/DDG and CFG edges, folding non-causal blocks into single-line "
+            "`# [condensed block: N statements]` markers within `token_budget`, and returns the method's "
+            "data-flow summary (reads, writes, calls)."
+        ),
+        args_schema=CondenseMethodSliceInput,
+    )
+
+    tool_patch = StructuredTool.from_function(
+        func=_verify_patch,
+        name="verify_patch",
+        description=(
+            "Blind-Locate, Surgical-Patch (BLSP) Verifier: Extracts the surrounding 15 lines from disk at "
+            "`(target, line_number)`, applies a surgical `old_string -> new_string` diff, executes `pytest` "
+            "via subprocess, and returns `status='SOLVED'` (returncode 0) or parses the new `AssertionError` "
+            "traceback and implicated variables to route back to `condense_method_slice`."
+        ),
+        args_schema=VerifyPatchInput,
+    )
+
     tool_rag = StructuredTool.from_function(
         func=_semantic_code_search,
         name="semantic_code_search",
@@ -270,4 +372,4 @@ def create_cpg_langchain_tools(
         args_schema=SemanticSearchInput,
     )
 
-    return [tool_ast, tool_cfg, tool_df, tool_sink, tool_rag]
+    return [tool_ast, tool_cfg, tool_df, tool_sink, tool_slice, tool_patch, tool_rag]

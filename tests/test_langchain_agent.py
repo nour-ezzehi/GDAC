@@ -11,6 +11,8 @@ from agent_langchain_tools import (
     TraverseCFGInput,
     TraverseDataFlowInput,
     TraceVariableToSinkInput,
+    CondenseMethodSliceInput,
+    VerifyPatchInput,
     SemanticSearchInput,
     create_cpg_langchain_tools,
 )
@@ -20,16 +22,24 @@ from agent_langchain import (
     create_cpg_langgraph_agent,
     run_langgraph_agent_loop,
 )
+from agent_tools import reset_tool_memory
 from cpg_bridge import load_cpg_json
+from cpg_condenser import condense_cpg
+
+
+@pytest.fixture(autouse=True)
+def _clear_memory():
+    """Clears global tool memory before each test."""
+    reset_tool_memory()
 
 
 @pytest.fixture(scope="module")
 def sample_graph() -> nx.MultiDiGraph:
-    """Loads the test CPG graph from cpg_json/."""
+    """Loads and condenses the test CPG graph from cpg_json/."""
     cpg_path = Path(__file__).parent.parent / "cpg_json"
     if not cpg_path.exists():
         pytest.skip(f"CPG directory not found at {cpg_path}")
-    return load_cpg_json(cpg_path)
+    return condense_cpg(load_cpg_json(cpg_path))
 
 
 class TestLangChainTools:
@@ -45,18 +55,32 @@ class TestLangChainTools:
         sink_in = TraceVariableToSinkInput(target="apply_discount", var_name="discount_percent")
         assert sink_in.var_name == "discount_percent"
 
+        slice_in = CondenseMethodSliceInput(target="apply_discount", target_vars=["discount_percent"])
+        assert slice_in.target == "apply_discount"
+        assert slice_in.token_budget == 200
+
+        patch_in = VerifyPatchInput(
+            target="InventoryManager.apply_discount",
+            line_number=84,
+            old_string="item.price = round(item.price * (discount_percent / 100.0), 2)",
+            new_string="item.price = round(item.price * (1 - discount_percent / 100.0), 2)",
+        )
+        assert patch_in.line_number == 84
+
         search_in = SemanticSearchInput(query="discount error")
         assert search_in.top_k == 3
 
     def test_tools_creation(self, sample_graph):
-        """Verifies that all 5 structured tools are properly instantiated."""
+        """Verifies that all 7 structured tools are properly instantiated."""
         tools = create_cpg_langchain_tools(sample_graph)
-        assert len(tools) == 5
+        assert len(tools) == 7
         tool_names = {t.name for t in tools}
         assert "traverse_ast" in tool_names
         assert "traverse_cfg" in tool_names
         assert "traverse_data_flow" in tool_names
         assert "trace_variable_to_sink" in tool_names
+        assert "condense_method_slice" in tool_names
+        assert "verify_patch" in tool_names
         assert "semantic_code_search" in tool_names
 
     def test_traverse_ast_tool(self, sample_graph):
@@ -66,6 +90,7 @@ class TestLangChainTools:
         data = json.loads(res_str)
         assert "ast_nodes" in data
         assert data["total_nodes_found"] > 0
+        assert "data_flow_summary" in data
 
     def test_trace_variable_to_sink_tool(self, sample_graph):
         """Executes macro-tool trace_variable_to_sink."""
@@ -79,6 +104,56 @@ class TestLangChainTools:
         assert len(data["propagation_path"]) >= 1
         assert "summary" in data
 
+    def test_condense_method_slice_tool(self, sample_graph):
+        """Executes condense_method_slice tool with Pydantic validation."""
+        tools = {t.name: t for t in create_cpg_langchain_tools(sample_graph)}
+        res_str = tools["condense_method_slice"].invoke({
+            "target": "InventoryManager.apply_discount",
+            "target_vars": ["discount_percent", "new_price"],
+            "token_budget": 200,
+        })
+        data = json.loads(res_str)
+        assert "slice_text" in data
+        assert "method_summary" in data
+        assert "token_stats" in data
+        assert len(data["slice_text"]) > 0
+
+    def test_verify_patch_tool_solved_and_failed(self, sample_graph):
+        """Tests BLSP 15-line context materialization, surgical diff, pytest run, and rollback."""
+        tools = {t.name: t for t in create_cpg_langchain_tools(sample_graph)}
+        inv_file = Path(__file__).parent.parent / "stackflow" / "stackflow" / "inventory.py"
+        original_disk = inv_file.read_text(encoding="utf-8")
+
+        # 1. Failing surgical patch -> returncode != 0, parses AssertionError & implicated_variables
+        fail_str = tools["verify_patch"].invoke({
+            "target": "InventoryManager.apply_discount",
+            "line_number": 84,
+            "old_string": "item.price = round(item.price * discount_percent / 100.0, 2)",
+            "new_string": "item.price = round(item.price - discount_percent / 100.0, 2)",
+        })
+        fail_data = json.loads(fail_str)
+        assert fail_data["status"] == "FAILED"
+        assert fail_data["returncode"] != 0
+        assert "AssertionError" in fail_data["traceback"] or "FAILED" in fail_data["traceback"]
+        assert len(fail_data["implicated_variables"]) > 0
+        assert len(fail_data["materialized_window"].splitlines()) == 15
+        # Verify file was rolled back cleanly
+        assert inv_file.read_text(encoding="utf-8") == original_disk
+
+        # 2. Passing surgical patch (even with CPG-normalized old_string!) -> returncode == 0, status == SOLVED
+        pass_str = tools["verify_patch"].invoke({
+            "target": "InventoryManager.apply_discount",
+            "line_number": 84,
+            "old_string": "item.price = round(item.price * discount_percent / 100.0, 2)",
+            "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)",
+        })
+        pass_data = json.loads(pass_str)
+        assert pass_data["status"] == "SOLVED"
+        assert pass_data["returncode"] == 0
+        assert len(pass_data["materialized_window"].splitlines()) == 15
+        # Verify file remains clean after verification when keep_patch=False
+        assert inv_file.read_text(encoding="utf-8") == original_disk
+
     def test_semantic_code_search_tool(self, sample_graph):
         """Executes dynamic semantic code search tool."""
         tools = {t.name: t for t in create_cpg_langchain_tools(sample_graph)}
@@ -89,10 +164,10 @@ class TestLangChainTools:
 
 
 class TestLangGraphAgent:
-    """Verifies LangGraph StateGraph, state tracking, and anti-looping guards."""
+    """Verifies LangGraph StateGraph, BLSP feedback routing, and anti-looping guards."""
 
     def test_state_graph_discount_simulation(self, sample_graph):
-        """Tests complete 3-turn state transition on discount bug."""
+        """Tests complete BLSP state transition on discount bug terminating with status='SOLVED'."""
         mock_llm = MockGoTChatModel(problem_type="discount")
         deduction = run_langgraph_agent_loop(
             mock_llm,
@@ -103,9 +178,10 @@ class TestLangGraphAgent:
         )
         assert "apply_discount" in deduction
         assert "round(item.price * (1 - discount_percent / 100.0), 2)" in deduction
+        assert "SOLVED" in deduction
 
     def test_state_graph_summary_simulation(self, sample_graph):
-        """Tests complete 3-turn state transition on summary bug."""
+        """Tests complete BLSP state transition on summary bug terminating with status='SOLVED'."""
         mock_llm = MockGoTChatModel(problem_type="summary")
         deduction = run_langgraph_agent_loop(
             mock_llm,
@@ -116,6 +192,66 @@ class TestLangGraphAgent:
         )
         assert "generate_category_summary" in deduction
         assert "summary.get(category, 0.0) + item_total" in deduction
+        assert "SOLVED" in deduction
+
+    def test_blsp_retry_loop_to_solved(self, sample_graph):
+        """Verifies failed patch -> traceback parsing + condense_method_slice feedback loop -> SOLVED."""
+        mock_llm = MockGoTChatModel(problem_type="discount_retry")
+        tools = create_cpg_langchain_tools(sample_graph)
+        app = create_cpg_langgraph_agent(
+            mock_llm, tools, sample_graph, max_turns=6, max_patch_attempts=3
+        )
+        config = {"configurable": {"thread_id": "test_blsp_retry"}}
+        final_state = app.invoke(
+            {
+                "messages": [],
+                "visited_nodes": set(),
+                "visited_signatures": set(),
+                "entry_points": [],
+                "final_deduction": None,
+                "turn_count": 0,
+                "status": "IN_PROGRESS",
+                "patch_attempts": 0,
+                "max_patch_attempts": 3,
+                "failure_tracebacks": [],
+                "implicated_variables": [],
+            },
+            config=config,
+        )
+        assert final_state["status"] == "SOLVED"
+        assert final_state["patch_attempts"] == 2
+        assert len(final_state["failure_tracebacks"]) == 1
+        assert len(final_state["implicated_variables"]) >= 1
+        assert "SOLVED" in (final_state["final_deduction"] or "")
+
+    def test_blsp_max_retry_cap_termination(self, sample_graph):
+        """Verifies that exceeding max_patch_attempts terminates the graph with FAILED_MAX_RETRIES."""
+        mock_llm = MockGoTChatModel(problem_type="discount_retry")
+        tools = create_cpg_langchain_tools(sample_graph)
+        # Set max_patch_attempts=1 so the first failed patch immediately triggers the hard retry cap
+        app = create_cpg_langgraph_agent(
+            mock_llm, tools, sample_graph, max_turns=6, max_patch_attempts=1
+        )
+        config = {"configurable": {"thread_id": "test_blsp_cap"}}
+        final_state = app.invoke(
+            {
+                "messages": [],
+                "visited_nodes": set(),
+                "visited_signatures": set(),
+                "entry_points": [],
+                "final_deduction": None,
+                "turn_count": 0,
+                "status": "IN_PROGRESS",
+                "patch_attempts": 0,
+                "max_patch_attempts": 1,
+                "failure_tracebacks": [],
+                "implicated_variables": [],
+            },
+            config=config,
+        )
+        assert final_state["status"] == "FAILED_MAX_RETRIES"
+        assert final_state["patch_attempts"] == 1
+        assert "max_patch_attempts" in (final_state["final_deduction"] or "")
 
     def test_anti_looping_state_interception(self, sample_graph):
         """Verifies that LangGraph tool_node intercepts repeated tool calls."""
@@ -132,7 +268,7 @@ class TestLangGraphAgent:
                     content="Testing looping",
                     tool_calls=[
                         {"name": "traverse_ast", "args": {"target": "apply_discount"}, "id": call_id_1, "type": "tool_call"},
-                        {"name": "traverse_ast", "args": {"target": "apply_discount"}, "id": call_id_2, "type": "tool_call"},
+                        {"name": "traverse_ast", "args": {"target": "apply_discount"}, "id": call_id_2, "id": call_id_2, "type": "tool_call"},
                     ],
                 )
             ],

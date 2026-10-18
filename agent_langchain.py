@@ -45,7 +45,7 @@ from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 # 1. LangGraph State Definition
 # ==============================================================================
 
-class CPGDebugState(TypedDict):
+class CPGDebugState(TypedDict, total=False):
     """The central state of the Graph-of-Thoughts debugging agent."""
     messages: Annotated[List[BaseMessage], add_messages]
     visited_nodes: Set[int]
@@ -53,6 +53,11 @@ class CPGDebugState(TypedDict):
     entry_points: List[Dict[str, Any]]
     final_deduction: Optional[str]
     turn_count: int
+    status: Optional[str]
+    patch_attempts: int
+    max_patch_attempts: int
+    failure_tracebacks: List[str]
+    implicated_variables: List[str]
 
 
 # ==============================================================================
@@ -216,7 +221,7 @@ class LocalHuggingFaceChatModel(BaseChatModel):
 # ==============================================================================
 
 class MockGoTChatModel(BaseChatModel):
-    """Simulates multi-turn GoT reasoning steps without loading PyTorch weights."""
+    """Simulates multi-turn GoT reasoning steps including BLSP verify_patch execution."""
 
     problem_type: str = "discount"
     call_index: int = 0
@@ -243,33 +248,24 @@ class MockGoTChatModel(BaseChatModel):
                     "### [Hypothesis]\n"
                     "The discount calculation appears flawed in `InventoryManager.apply_discount`.\n\n"
                     "### [Action]\n"
-                    "Inspecting the AST of `InventoryManager.apply_discount`."
+                    "Computing the causal program slice of `InventoryManager.apply_discount` on `discount_percent` and `item.price`."
                 )
                 tool_calls = [{
-                    "name": "traverse_ast",
-                    "args": {"target": "InventoryManager.apply_discount"},
+                    "name": "condense_method_slice",
+                    "args": {
+                        "target": "InventoryManager.apply_discount",
+                        "target_vars": ["discount_percent", "item.price"],
+                    },
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "tool_call",
                 }]
             elif self.call_index == 2:
                 content = (
                     "### [Observation]\n"
-                    "The AST shows multiplication and division in `item.price * discount_percent / 100.0`.\n\n"
-                    "### [Action]\n"
-                    "Tracing data flow of `discount_percent` using Macro-Tool."
-                )
-                tool_calls = [{
-                    "name": "trace_variable_to_sink",
-                    "args": {"target": "InventoryManager.apply_discount", "var_name": "discount_percent"},
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "tool_call",
-                }]
-            else:
-                content = (
+                    "Line 84 computes `item.price = round(item.price * discount_percent / 100.0, 2)`.\n\n"
                     "### [Synthesis & Deduction]\n"
-                    "The data flow reveals that `discount_percent` calculates the discount amount ($20.0) "
-                    "rather than subtracting from the price ($80.0).\n\n"
-                    "### [Conclusion]\n"
+                    "The formula multiplies by `discount_percent / 100.0` ($20.0) instead of subtracting the discount (`1 - discount_percent / 100.0`, $80.0).\n\n"
+                    "### [Verification / Conclusion]\n"
                     "- Bug Location: `stackflow/inventory.py` line 84 in `apply_discount`\n"
                     "- Root Cause: Formula multiplies instead of `item.price * (1 - discount_percent / 100.0)`\n"
                     "- Exact Fix:\n"
@@ -277,7 +273,82 @@ class MockGoTChatModel(BaseChatModel):
                     "item.price = round(item.price * (1 - discount_percent / 100.0), 2)\n"
                     "```"
                 )
+                tool_calls = [{
+                    "name": "verify_patch",
+                    "args": {
+                        "target": "InventoryManager.apply_discount",
+                        "line_number": 84,
+                        "old_string": "item.price = round(item.price * (discount_percent / 100.0), 2)",
+                        "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)",
+                    },
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                }]
+            else:
+                content = (
+                    "### [Conclusion]\n"
+                    "- Bug Location: `stackflow/inventory.py` line 84 in `apply_discount`\n"
+                    "- Exact Fix:\n"
+                    "```python\n"
+                    "item.price = round(item.price * (1 - discount_percent / 100.0), 2)\n"
+                    "```"
+                )
                 tool_calls = []
+
+        elif self.problem_type == "discount_retry":
+            # Simulates a failed patch attempt -> forced re-slice on implicated vars -> successful patch
+            if self.call_index == 1:
+                content = (
+                    "### [Hypothesis]\n"
+                    "Attempting an initial patch on line 84 of `InventoryManager.apply_discount`."
+                )
+                tool_calls = [{
+                    "name": "verify_patch",
+                    "args": {
+                        "target": "InventoryManager.apply_discount",
+                        "line_number": 84,
+                        "old_string": "item.price = round(item.price * (discount_percent / 100.0), 2)",
+                        "new_string": "item.price = round(item.price - (discount_percent / 100.0), 2)",
+                    },
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                }]
+            elif self.call_index == 2:
+                content = (
+                    "### [Observation]\n"
+                    "Previous patch failed pytest with `AssertionError: assert 99.8 == 80.0`. "
+                    "Looping back to `condense_method_slice` on the newly implicated variables."
+                )
+                tool_calls = [{
+                    "name": "condense_method_slice",
+                    "args": {
+                        "target": "InventoryManager.apply_discount",
+                        "target_vars": ["item.price", "discount_percent"],
+                    },
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                }]
+            else:
+                content = (
+                    "### [Synthesis & Deduction]\n"
+                    "Re-slicing confirms percentage multiplier `1 - discount_percent / 100.0` is required.\n\n"
+                    "### [Verification / Conclusion]\n"
+                    "```python\n"
+                    "item.price = round(item.price * (1 - discount_percent / 100.0), 2)\n"
+                    "```"
+                )
+                tool_calls = [{
+                    "name": "verify_patch",
+                    "args": {
+                        "target": "InventoryManager.apply_discount",
+                        "line_number": 84,
+                        "old_string": "item.price = round(item.price * (discount_percent / 100.0), 2)",
+                        "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)",
+                    },
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                }]
+
         else:
             # Summary bug scenario
             if self.call_index == 1:
@@ -285,34 +356,46 @@ class MockGoTChatModel(BaseChatModel):
                     "### [Hypothesis]\n"
                     "Category aggregation bug in `InventoryReporter.generate_category_summary`.\n\n"
                     "### [Action]\n"
-                    "Inspecting the AST of `InventoryReporter.generate_category_summary`."
+                    "Computing the causal program slice of `InventoryReporter.generate_category_summary` on `summary` and `item_total`."
                 )
                 tool_calls = [{
-                    "name": "traverse_ast",
-                    "args": {"target": "InventoryReporter.generate_category_summary"},
+                    "name": "condense_method_slice",
+                    "args": {
+                        "target": "InventoryReporter.generate_category_summary",
+                        "target_vars": ["summary", "item_total"],
+                    },
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "tool_call",
                 }]
             elif self.call_index == 2:
                 content = (
                     "### [Observation]\n"
-                    "Loop iterates over items and assigns `summary[category] = item_total`.\n\n"
-                    "### [Action]\n"
-                    "Tracing `item_total` to its sink."
+                    "Line 34 inside the loop overwrites `summary[item.category] = round(item_total, 2)`.\n\n"
+                    "### [Synthesis & Deduction]\n"
+                    "The dictionary assignment overwrites rather than accumulating values (`summary.get(category, 0.0) + item_total`).\n\n"
+                    "### [Verification / Conclusion]\n"
+                    "- Bug Location: `stackflow/reports.py` line 34 in `generate_category_summary`\n"
+                    "- Root Cause: `summary[item.category] = round(item_total, 2)` overwrites instead of accumulating `summary.get(category, 0.0) + item_total`\n"
+                    "- Exact Fix:\n"
+                    "```python\n"
+                    "summary[item.category] = round(summary.get(item.category, 0.0) + item_total, 2)\n"
+                    "```"
                 )
                 tool_calls = [{
-                    "name": "trace_variable_to_sink",
-                    "args": {"target": "InventoryReporter.generate_category_summary", "var_name": "item_total"},
+                    "name": "verify_patch",
+                    "args": {
+                        "target": "InventoryReporter.generate_category_summary",
+                        "line_number": 34,
+                        "old_string": "summary[item.category] = round(item_total, 2)",
+                        "new_string": "summary[item.category] = round(summary.get(item.category, 0.0) + item_total, 2)",
+                    },
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "tool_call",
                 }]
             else:
                 content = (
-                    "### [Synthesis & Deduction]\n"
-                    "The dictionary assignment overwrites rather than accumulating values.\n\n"
                     "### [Conclusion]\n"
                     "- Bug Location: `stackflow/reports.py` in `generate_category_summary`\n"
-                    "- Root Cause: `summary[category] = item_total` overwrites instead of `summary[category] = summary.get(category, 0.0) + item_total`\n"
                     "- Exact Fix:\n"
                     "```python\n"
                     "summary[category] = summary.get(category, 0.0) + item_total\n"
@@ -332,18 +415,23 @@ def create_cpg_langgraph_agent(
     tools: List[BaseTool],
     graph: nx.MultiDiGraph,
     max_turns: int = 6,
+    max_patch_attempts: int = 3,
     checkpointer: Optional[Any] = None,
 ) -> Any:
-    """Builds a compiled LangGraph StateGraph agent with anti-looping guards."""
+    """Builds a compiled LangGraph StateGraph agent with anti-looping guards and BLSP feedback routing."""
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 
     def agent_node(state: CPGDebugState) -> Dict[str, Any]:
         """Calls the model with current messages and increments turn counter."""
-        response = model_with_tools.invoke(state["messages"])
+        msgs = state.get("messages") or []
+        if msgs and isinstance(msgs[-1], AIMessage) and getattr(msgs[-1], "tool_calls", None):
+            return {"turn_count": state.get("turn_count", 0)}
+
+        response = model_with_tools.invoke(msgs)
         new_turn = state.get("turn_count", 0) + 1
 
-        final_ded = None
+        final_ded = state.get("final_deduction")
         # If model produced no tool calls, it has finished reasoning
         if not getattr(response, "tool_calls", None):
             final_ded = response.content
@@ -355,26 +443,37 @@ def create_cpg_langgraph_agent(
         }
 
     def tool_node(state: CPGDebugState) -> Dict[str, Any]:
-        """Executes tool calls with state-level anti-looping interceptors."""
+        """Executes tool calls with state-level anti-looping interceptors and BLSP feedback routing."""
         last_msg = state["messages"][-1]
         tool_calls = getattr(last_msg, "tool_calls", []) or []
 
         visited_nodes = set(state.get("visited_nodes") or set())
         visited_signatures = set(state.get("visited_signatures") or set())
+        patch_attempts = int(state.get("patch_attempts") or 0)
+        max_retries = int(state.get("max_patch_attempts") or max_patch_attempts)
+        failure_tracebacks = list(state.get("failure_tracebacks") or [])
+        implicated_variables = list(state.get("implicated_variables") or [])
+        current_status = state.get("status") or "IN_PROGRESS"
+        final_deduction = state.get("final_deduction")
         tool_messages = []
 
         for tc in tool_calls:
             t_name = tc["name"]
             t_args = tc.get("args") or {}
             target = str(t_args.get("target") or t_args.get("method_name") or "").strip().lower()
-            var_name = str(t_args.get("var_name") or "").strip().lower()
-            sig = (t_name, target, var_name)
+            var_key = str(
+                t_args.get("var_name")
+                or t_args.get("target_vars")
+                or t_args.get("new_string")
+                or ""
+            ).strip().lower()
+            sig = (t_name, target, var_key)
 
             # Resolve target node in CPG
             resolved_id = resolve_target_node(graph, t_args.get("target") or t_args.get("method_name"))
 
             # Anti-Looping Interception
-            if sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_name):
+            if sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_key):
                 err_msg = json.dumps({
                     "error": "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
                 })
@@ -383,7 +482,7 @@ def create_cpg_langgraph_agent(
 
             # Record visit in state
             visited_signatures.add(sig)
-            if resolved_id:
+            if resolved_id and t_name != "verify_patch":
                 visited_nodes.add(resolved_id)
 
             # Execute tool
@@ -397,17 +496,83 @@ def create_cpg_langgraph_agent(
             else:
                 tool_output = json.dumps({"error": f"Tool '{t_name}' not found."})
 
+            # BLSP Feedback Routing for `verify_patch`
+            if t_name == "verify_patch":
+                try:
+                    res_data = json.loads(tool_output)
+                except json.JSONDecodeError:
+                    res_data = {}
+
+                patch_status = res_data.get("status")
+                returncode = res_data.get("returncode")
+
+                if patch_status == "SOLVED" and returncode == 0:
+                    patch_attempts += 1
+                    current_status = "SOLVED"
+                    base_content = getattr(last_msg, "content", "") or ""
+                    verification_summary = (
+                        f"\n\n### [BLSP Runtime Verification: SOLVED]\n"
+                        f"- **Status**: `SOLVED` (`pytest` returncode = 0)\n"
+                        f"- **Target**: `{res_data.get('target')}` (`{res_data.get('file_path')}` L{res_data.get('applied_line')})\n"
+                        f"- **Surgical Diff**: `{res_data.get('old_string')}` -> `{res_data.get('new_string')}`"
+                    )
+                    final_deduction = (base_content + verification_summary).strip()
+
+                elif patch_status in ("FAILED", "ERROR"):
+                    patch_attempts += 1
+                    tb_text = str(res_data.get("traceback") or res_data.get("error") or "")
+                    if tb_text:
+                        failure_tracebacks.append(tb_text)
+                    new_vars = list(res_data.get("implicated_variables") or [])
+                    if new_vars:
+                        implicated_variables = new_vars
+
+                    # Clear prior condense_method_slice signatures for this target so re-slicing is allowed
+                    visited_signatures = {
+                        s for s in visited_signatures
+                        if not (s[0] == "condense_method_slice" and s[1] == target)
+                    }
+
+                    if patch_attempts >= max_retries:
+                        current_status = "FAILED_MAX_RETRIES"
+                        final_deduction = (
+                            f"BLSP Verification terminated after reaching max_patch_attempts ({max_retries}).\n"
+                            f"Last AssertionError / Traceback:\n{tb_text}"
+                        )
+                    else:
+                        current_status = "RETRY"
+                        # Force an immediate condense_method_slice on the newly implicated variables
+                        if "condense_method_slice" in tools_by_name and implicated_variables:
+                            try:
+                                reslice_raw = tools_by_name["condense_method_slice"].invoke({
+                                    "target": t_args.get("target"),
+                                    "target_vars": implicated_variables,
+                                    "token_budget": 200,
+                                })
+                                res_data["forced_condense_method_slice"] = json.loads(reslice_raw)
+                                tool_output = json.dumps(res_data, indent=2)
+                            except Exception:
+                                pass
+
             tool_messages.append(ToolMessage(content=tool_output, tool_call_id=tc["id"], name=t_name))
 
         return {
             "messages": tool_messages,
             "visited_nodes": visited_nodes,
             "visited_signatures": visited_signatures,
+            "status": current_status,
+            "patch_attempts": patch_attempts,
+            "max_patch_attempts": max_retries,
+            "failure_tracebacks": failure_tracebacks,
+            "implicated_variables": implicated_variables,
+            "final_deduction": final_deduction,
         }
 
     def should_continue(state: CPGDebugState) -> str:
-        """Determines whether to execute tools or end the loop."""
-        if state.get("final_deduction") is not None:
+        """Determines whether to execute tools or end the loop after agent_node."""
+        if state.get("status") in ("SOLVED", "FAILED_MAX_RETRIES"):
+            return END
+        if state.get("final_deduction") is not None and not getattr(state["messages"][-1], "tool_calls", None):
             return END
         if state.get("turn_count", 0) >= max_turns:
             return END
@@ -416,6 +581,14 @@ def create_cpg_langgraph_agent(
             return "tools"
         return END
 
+    def should_continue_after_tools(state: CPGDebugState) -> str:
+        """Routes after tool_node: terminates on SOLVED or FAILED_MAX_RETRIES, otherwise loops back to agent."""
+        if state.get("status") in ("SOLVED", "FAILED_MAX_RETRIES"):
+            return END
+        if state.get("turn_count", 0) >= max_turns:
+            return END
+        return "agent"
+
     # Build Graph
     workflow = StateGraph(CPGDebugState)
     workflow.add_node("agent", agent_node)
@@ -423,7 +596,7 @@ def create_cpg_langgraph_agent(
 
     workflow.set_entry_point("agent")
     workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    workflow.add_edge("tools", "agent")
+    workflow.add_conditional_edges("tools", should_continue_after_tools, {"agent": "agent", END: END})
 
     memory = checkpointer if checkpointer is not None else MemorySaver()
     return workflow.compile(checkpointer=memory)
@@ -438,6 +611,7 @@ def run_langgraph_agent_loop(
     graph: nx.MultiDiGraph,
     problem_prompt: str,
     max_turns: int = 6,
+    max_patch_attempts: int = 3,
     thread_id: str = "got_debug_session",
 ) -> str:
     """Executes the autonomous debugging loop using LangGraph."""
@@ -453,7 +627,14 @@ def run_langgraph_agent_loop(
     # Initialize tools and state graph
     tools = create_cpg_langchain_tools(graph)
     checkpointer = MemorySaver()
-    app = create_cpg_langgraph_agent(model, tools, graph, max_turns=max_turns, checkpointer=checkpointer)
+    app = create_cpg_langgraph_agent(
+        model,
+        tools,
+        graph,
+        max_turns=max_turns,
+        max_patch_attempts=max_patch_attempts,
+        checkpointer=checkpointer,
+    )
 
     initial_messages: List[BaseMessage] = [
         SystemMessage(content=GRAPH_OF_THOUGHTS_SYSTEM_PROMPT),
@@ -467,6 +648,11 @@ def run_langgraph_agent_loop(
         "entry_points": entry_points,
         "final_deduction": None,
         "turn_count": 0,
+        "status": "IN_PROGRESS",
+        "patch_attempts": 0,
+        "max_patch_attempts": max_patch_attempts,
+        "failure_tracebacks": [],
+        "implicated_variables": [],
     }
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -492,11 +678,19 @@ def run_langgraph_agent_loop(
                 for tm in node_output.get("messages", []):
                     lines = len(tm.content.splitlines())
                     print(f"[*] Executed Graph Tool: `{tm.name}` -> Returned {lines} lines.")
+                if node_output.get("status") == "SOLVED" and node_output.get("final_deduction"):
+                    print("[+] BLSP Runtime Verification succeeded (status='SOLVED'). Terminating graph.")
+                    final_result = node_output["final_deduction"]
+                elif node_output.get("status") == "FAILED_MAX_RETRIES" and node_output.get("final_deduction"):
+                    print("[!] Reached maximum BLSP patch retry attempts. Terminating graph.")
+                    final_result = node_output["final_deduction"]
 
     if not final_result:
         # Extract from the latest checkpoint
         final_state = app.get_state(config).values
-        if final_state.get("messages"):
+        if final_state.get("final_deduction"):
+            final_result = final_state["final_deduction"]
+        elif final_state.get("messages"):
             final_result = final_state["messages"][-1].content
         else:
             final_result = "No deduction produced."
