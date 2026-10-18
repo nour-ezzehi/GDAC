@@ -37,7 +37,8 @@ from langgraph.graph.message import add_messages
 
 from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
 from agent_langchain_tools import create_cpg_langchain_tools
-from agent_tools import resolve_target_node
+from agent_tools import GLOBAL_TOOL_MEMORY, reset_tool_memory, resolve_target_node
+from cpg_condenser import condense_method_slice
 from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 
 
@@ -446,6 +447,8 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             "pad_token_id": self.tokenizer.pad_token_id,
             "stopping_criteria": StoppingCriteriaList([_ToolCallStoppingCriteria()]),
         }
+        if hasattr(self.model, "generation_config") and getattr(self.model.generation_config, "max_length", None) is not None:
+            self.model.generation_config.max_length = None
 
         with torch.no_grad():
             outputs = self.model.generate(**inputs, **gen_kwargs)
@@ -717,8 +720,26 @@ def create_cpg_langgraph_agent(
 
         for tc in tool_calls:
             t_name = tc["name"]
-            t_args = tc.get("args") or {}
-            target = str(t_args.get("target") or t_args.get("method_name") or "").strip().lower()
+            t_args = dict(tc.get("args") or {})
+            target_raw = (
+                t_args.get("target")
+                or t_args.get("method_name")
+                or t_args.get("method_id")
+            )
+            if target_raw is not None and not t_args.get("target"):
+                t_args["target"] = str(target_raw)
+
+            # Resolve target node in CPG
+            resolved_id = resolve_target_node(graph, target_raw)
+
+            # If condense_method_slice is invoked without target_vars, default to the method's writes + reads
+            if t_name == "condense_method_slice" and not (t_args.get("target_vars") or t_args.get("var_name")):
+                if resolved_id is not None and resolved_id in graph:
+                    df_sum = graph.nodes[resolved_id].get("data_flow_summary") or {}
+                    auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
+                    t_args["target_vars"] = [v for v in auto_vars if v != "self"]
+
+            target = str(t_args.get("target") or "").strip().lower()
             var_key = str(
                 t_args.get("var_name")
                 or t_args.get("target_vars")
@@ -727,9 +748,6 @@ def create_cpg_langgraph_agent(
             ).strip().lower()
             sig = (t_name, target, var_key)
 
-            # Resolve target node in CPG
-            resolved_id = resolve_target_node(graph, t_args.get("target") or t_args.get("method_name"))
-
             # Anti-Looping Interception
             if sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_key):
                 err_msg = json.dumps({
@@ -737,11 +755,6 @@ def create_cpg_langgraph_agent(
                 })
                 tool_messages.append(ToolMessage(content=err_msg, tool_call_id=tc["id"], name=t_name))
                 continue
-
-            # Record visit in state
-            visited_signatures.add(sig)
-            if resolved_id and t_name != "verify_patch":
-                visited_nodes.add(resolved_id)
 
             # Execute tool
             if t_name in tools_by_name:
@@ -754,13 +767,20 @@ def create_cpg_langgraph_agent(
             else:
                 tool_output = json.dumps({"error": f"Tool '{t_name}' not found."})
 
+            # Only record visit in state if tool succeeded without error
+            try:
+                parsed_out = json.loads(tool_output)
+            except json.JSONDecodeError:
+                parsed_out = {}
+
+            if "error" not in parsed_out:
+                visited_signatures.add(sig)
+                if resolved_id and t_name != "verify_patch":
+                    visited_nodes.add(resolved_id)
+
             # BLSP Feedback Routing for `verify_patch`
             if t_name == "verify_patch":
-                try:
-                    res_data = json.loads(tool_output)
-                except json.JSONDecodeError:
-                    res_data = {}
-
+                res_data = parsed_out
                 patch_status = res_data.get("status")
                 returncode = res_data.get("returncode")
 
@@ -785,11 +805,14 @@ def create_cpg_langgraph_agent(
                     if new_vars:
                         implicated_variables = new_vars
 
-                    # Clear prior condense_method_slice signatures for this target so re-slicing is allowed
+                    # Clear prior condense_method_slice signatures and node memory so re-slicing is allowed
                     visited_signatures = {
                         s for s in visited_signatures
                         if not (s[0] == "condense_method_slice" and s[1] == target)
                     }
+                    if resolved_id is not None:
+                        visited_nodes.discard(resolved_id)
+                    GLOBAL_TOOL_MEMORY.allow_reslice(resolved_id, target)
 
                     if patch_attempts >= max_retries:
                         current_status = "FAILED_MAX_RETRIES"
@@ -799,15 +822,16 @@ def create_cpg_langgraph_agent(
                         )
                     else:
                         current_status = "RETRY"
-                        # Force an immediate condense_method_slice on the newly implicated variables
-                        if "condense_method_slice" in tools_by_name and implicated_variables:
+                        # Force an immediate condense_method_slice directly on the graph without polluting ToolMemoryBuffer
+                        if resolved_id is not None and implicated_variables:
                             try:
-                                reslice_raw = tools_by_name["condense_method_slice"].invoke({
-                                    "target": t_args.get("target"),
-                                    "target_vars": implicated_variables,
-                                    "token_budget": 200,
-                                })
-                                res_data["forced_condense_method_slice"] = json.loads(reslice_raw)
+                                reslice_dict = condense_method_slice(
+                                    graph,
+                                    method_id=resolved_id,
+                                    target_vars=implicated_variables,
+                                    token_budget=200,
+                                )
+                                res_data["forced_condense_method_slice"] = reslice_dict
                                 tool_output = json.dumps(res_data, indent=2)
                             except Exception:
                                 pass
@@ -873,6 +897,8 @@ def run_langgraph_agent_loop(
     thread_id: str = "got_debug_session",
 ) -> str:
     """Executes the autonomous debugging loop using LangGraph."""
+    reset_tool_memory()
+
     # Step 0: Hybrid GraphRAG entry points
     if "Recommended Semantic Entry Points" not in problem_prompt:
         entry_points = find_semantic_entry_points(graph, problem_prompt, top_k=2)

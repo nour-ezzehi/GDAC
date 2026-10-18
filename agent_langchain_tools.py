@@ -120,13 +120,17 @@ class SemanticSearchInput(BaseModel):
 
 class CondenseMethodSliceInput(BaseModel):
     """Input schema for program slicing and non-causal block folding."""
-    target: str = Field(
-        ...,
-        description="Universal anchor: exact integer Node ID (e.g. '100000000001'), qualified name ('ClassName.method_name'), or method name.",
+    target: Optional[str] = Field(
+        None,
+        description="Universal anchor: exact integer Node ID (e.g. '107374182442'), qualified name ('ClassName.method_name'), or method name.",
     )
-    target_vars: str | List[str] = Field(
-        ...,
-        description="Variable name, list of variable names, or comma-separated list of variable names to slice on (e.g. 'discount_percent' or ['discount_percent', 'new_price']).",
+    target_vars: Optional[str | List[str]] = Field(
+        None,
+        description="Variable name, list of variable names, or comma-separated list of variable names to slice on. If omitted, automatically slices on all variables written by the method.",
+    )
+    method_id: Optional[int | str] = Field(
+        None,
+        description="Optional alias for target method node ID.",
     )
     token_budget: int = Field(
         200,
@@ -247,15 +251,17 @@ def create_cpg_langchain_tools(
         return json.dumps(res, indent=2)
 
     def _condense_method_slice(
-        target: str,
-        target_vars: str | List[str],
+        target: Optional[str] = None,
+        target_vars: Optional[str | List[str]] = None,
+        method_id: Optional[int | str] = None,
         token_budget: int = 200,
     ) -> str:
+        effective_target = target or (str(method_id) if method_id is not None else "")
         res = dispatch_tool(
             graph,
             "condense_method_slice",
             {
-                "target": target,
+                "target": effective_target,
                 "target_vars": target_vars,
                 "token_budget": token_budget,
             },

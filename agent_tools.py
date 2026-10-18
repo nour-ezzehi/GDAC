@@ -768,6 +768,16 @@ class ToolMemoryBuffer:
         self.visited_nodes.clear()
         self.history.clear()
 
+    def allow_reslice(self, resolved_node_id: Optional[int] = None, target_str: str = "") -> None:
+        """Clears prior condense_method_slice entries so BLSP retry loops can re-slice the target method."""
+        target_low = target_str.strip().lower()
+        self.visited_signatures = {
+            s for s in self.visited_signatures
+            if not (s[0] == "condense_method_slice" and (not target_low or s[1] == target_low))
+        }
+        if resolved_node_id is not None:
+            self.visited_nodes.discard(("condense_method_slice", resolved_node_id))
+
 
 GLOBAL_TOOL_MEMORY = ToolMemoryBuffer()
 
@@ -787,6 +797,7 @@ def dispatch_tool(
     target_arg = (
         arguments.get("target")
         or arguments.get("method_name")
+        or arguments.get("method_id")
         or arguments.get("node_id")
         or arguments.get("start_node_id")
         or arguments.get("source_node_id")
@@ -827,6 +838,15 @@ def dispatch_tool(
                 "available_methods": [m["name"] for m in all_methods[:15]],
                 "suggestion": "Select one of the available methods listed above.",
             }
+
+    # If condense_method_slice is called without target_vars, default to the method's writes + reads
+    if tool_name == "condense_method_slice":
+        tv_existing = arguments.get("target_vars") or arguments.get("var_name")
+        if not tv_existing and method_id is not None and method_id in graph:
+            df_sum = graph.nodes[method_id].get("data_flow_summary") or {}
+            auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
+            arguments = dict(arguments)
+            arguments["target_vars"] = [v for v in auto_vars if v != "self"]
 
     # Anti-looping interceptor: check deterministic memory buffer
     mem = memory if memory is not None else GLOBAL_TOOL_MEMORY
@@ -963,6 +983,10 @@ def dispatch_tool(
 
         elif tool_name == "condense_method_slice":
             target_vars_arg = arguments.get("target_vars") or arguments.get("var_name") or ""
+            if not target_vars_arg and method_id is not None and method_id in graph:
+                df_sum = graph.nodes[method_id].get("data_flow_summary") or {}
+                auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
+                target_vars_arg = [v for v in auto_vars if v != "self"]
             token_budget = int(arguments.get("token_budget", 200))
             slice_res = condense_method_slice(
                 graph,

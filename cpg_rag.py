@@ -282,16 +282,17 @@ class CPGSemanticIndex:
                 )
                 score = raw_score / (math.sqrt(sum(d_counts.values())) + 1e-5)
 
-            # Exact method/class name presence bonuses
-            if doc["method_name"].lower() in query.lower():
-                score += 3.5
-            if doc["class_name"] and doc["class_name"].lower() in query.lower():
-                score += 1.5
+            # Exact method/class name presence bonuses (only for production methods, not test functions mentioned in pytest headers)
+            if not doc["is_test"]:
+                if doc["method_name"].lower() in query.lower():
+                    score += 3.5
+                if doc["class_name"] and doc["class_name"].lower() in query.lower():
+                    score += 1.5
 
             scores.append(score)
         return scores
 
-    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 3, include_tests: bool = False) -> List[Dict[str, Any]]:
         """Finds top_k method entry points using Asymmetric Field-Weighted Hybrid Scoring:
         $S_{entry}(m, Q) = \\alpha \\cdot CosSim(E(m_{doc}), E(Q)) + \\beta \\cdot BM25(m_{text}, Q) + \\gamma \\cdot MutationOverlap(m, Q)$
         """
@@ -313,6 +314,8 @@ class CPGSemanticIndex:
 
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for idx, doc in enumerate(self.documents):
+            if doc["is_test"] and not include_tests:
+                continue
             doc_copy = dict(doc)
             lex_s = lexical_scores[idx]
             dense_s = dense_scores[idx]

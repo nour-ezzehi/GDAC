@@ -309,3 +309,32 @@ class TestLangGraphAgent:
         assert calls[0]["name"] == "traverse_ast"
         assert calls[0]["args"]["target"] == "InventoryManager.apply_discount"
 
+    def test_scenario2_entry_point_excludes_tests_and_condense_default_vars(self, sample_graph):
+        """Verifies that pytest tracebacks rank production methods #1 (excluding tests) and condense_method_slice works without target_vars."""
+        from agent_tools import reset_tool_memory
+        from cpg_rag import find_semantic_entry_points
+        reset_tool_memory()
+
+        scenario2_query = (
+            "A pytest suite is failing with the following error:\n"
+            "FAILED tests/test_reports.py::TestInventoryReporter::test_generate_category_summary_aggregates_multiple_items\n"
+            "AssertionError: Expected 'Electronics' total value to be 2950.0 (2000 + 500 + 450), "
+            "but `generate_category_summary()` returned 450.0 (only the last item's value!)."
+        )
+        entry_points = find_semantic_entry_points(sample_graph, scenario2_query, top_k=3)
+        assert len(entry_points) >= 1
+        assert entry_points[0]["qualified_name"] == "InventoryReporter.generate_category_summary"
+        assert all(not ep["qualified_name"].startswith("Test") for ep in entry_points)
+
+        tools = create_cpg_langchain_tools(sample_graph)
+        tools_by_name = {t.name: t for t in tools}
+        # Invoke condense_method_slice with method_id and WITHOUT target_vars (as Gemma did in Turn 3)
+        raw_out = tools_by_name["condense_method_slice"].invoke(
+            {"target": "InventoryReporter.generate_category_summary", "method_id": entry_points[0]["node_id"]}
+        )
+        parsed = json.loads(raw_out)
+        assert "error" not in parsed
+        assert "slice_text" in parsed
+        assert "method_summary" in parsed
+        assert "generate_category_summary" in parsed["slice_text"]
+
