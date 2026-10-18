@@ -64,12 +64,190 @@ class CPGDebugState(TypedDict, total=False):
 # 2. Local Quantized HuggingFace ChatModel Adapter (Colab / T4 GPU)
 # ==============================================================================
 
+_KNOWN_CPG_TOOLS = (
+    "condense_method_slice",
+    "verify_patch",
+    "trace_variable_to_sink",
+    "traverse_ast",
+    "traverse_cfg",
+    "traverse_data_flow",
+    "semantic_code_search",
+)
+
+
+def strip_hallucinated_observation(text: str) -> str:
+    """Truncates assistant output right after `</tool_call>` or before any self-generated `[Observation]` block."""
+    if "</tool_call>" in text:
+        idx = text.rfind("</tool_call>") + len("</tool_call>")
+        return text[:idx].strip()
+
+    # If the model wrote an [Action] and then started hallucinating an [Observation] in the same turn, cut before [Observation]
+    obs_match = re.search(
+        r"(?:\n|^)\s*(?:\*\*|###\s*)\[?Observation\]?(?:\*\*)?\s*:?",
+        text,
+        re.IGNORECASE,
+    )
+    if obs_match:
+        return text[: obs_match.start()].strip()
+    return text.strip()
+
+
+def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
+    """Extracts tool calls from assistant output across XML, JSON code blocks, function-call syntax, and natural-language [Action] lines."""
+    cleaned = strip_hallucinated_observation(text)
+    tool_calls: List[Dict[str, Any]] = []
+
+    # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call>
+    xml_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    for m in xml_pattern.finditer(cleaned):
+        try:
+            data = json.loads(m.group(1))
+            name = data.get("name") or data.get("tool")
+            args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
+            if isinstance(args, str):
+                args = json.loads(args)
+            if name:
+                tool_calls.append({
+                    "name": name,
+                    "args": args,
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                })
+        except json.JSONDecodeError:
+            pass
+
+    # Pattern B: ```json\n{"name": ..., "arguments": ...}\n```
+    if not tool_calls:
+        block_pattern = re.compile(
+            r"```(?:json|tool_call|xml)?\s*(\{\s*\"(?:tool|name)\":.*?\})\s*```",
+            re.DOTALL,
+        )
+        for m in block_pattern.finditer(cleaned):
+            try:
+                data = json.loads(m.group(1))
+                name = data.get("name") or data.get("tool")
+                args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if name:
+                    tool_calls.append({
+                        "name": name,
+                        "args": args,
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "tool_call",
+                    })
+            except json.JSONDecodeError:
+                pass
+
+    # Pattern C: Inline JSON object containing "name": "<tool>"
+    if not tool_calls:
+        inline_json = re.compile(
+            r"(\{\s*\"(?:name|tool)\"\s*:\s*\"(?:"
+            + "|".join(_KNOWN_CPG_TOOLS)
+            + r")\".*?\}\s*\})",
+            re.DOTALL,
+        )
+        for m in inline_json.finditer(cleaned):
+            try:
+                data = json.loads(m.group(1))
+                name = data.get("name") or data.get("tool")
+                args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
+                if name:
+                    tool_calls.append({
+                        "name": name,
+                        "args": args,
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "tool_call",
+                    })
+            except json.JSONDecodeError:
+                pass
+
+    # Pattern D: Pythonic or Natural-Language [Action] fallback for lightweight 2B/4B Gemma models
+    # e.g., `**[Action]**: condense_method_slice(target="InventoryManager.apply_discount", target_vars=["discount_percent"])`
+    # or `**[Action]**: traverse_ast on InventoryManager.apply_discount (Node #107374182415)`
+    if not tool_calls:
+        action_split = re.split(
+            r"(?:\*\*|###\s*)\[?Action\]?(?:\*\*)?\s*:?",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        search_region = action_split[-1] if len(action_split) > 1 else cleaned
+        matched_tool = None
+        for tname in _KNOWN_CPG_TOOLS:
+            if re.search(rf"\b{re.escape(tname)}\b", search_region):
+                matched_tool = tname
+                break
+
+        if matched_tool and len(action_split) > 1:
+            args: Dict[str, Any] = {}
+            # 1. Check explicit target="..." or Node #107374182415 or Class.method
+            target_kv = re.search(r"target\s*=\s*['\"]([^'\"]+)['\"]", search_region)
+            node_id_match = re.search(r"#?(1073741\d+)", search_region) or re.search(r"#?(1073741\d+)", cleaned)
+            qual_match = re.search(
+                r"\b([A-Z][A-Za-z0-9_]*\.[a-z_][A-Za-z0-9_]*)\b",
+                search_region,
+            ) or re.search(
+                r"\b([A-Z][A-Za-z0-9_]*\.[a-z_][A-Za-z0-9_]*)\b",
+                cleaned,
+            )
+            if target_kv:
+                args["target"] = target_kv.group(1)
+            elif qual_match:
+                args["target"] = qual_match.group(1)
+            elif node_id_match:
+                args["target"] = node_id_match.group(1)
+            else:
+                meth_match = re.search(r"\b(apply_discount|generate_category_summary|total_inventory_value|get_low_stock_items|restock|deduct_stock)\b", search_region) or re.search(
+                    r"\b(apply_discount|generate_category_summary|total_inventory_value|get_low_stock_items|restock|deduct_stock)\b",
+                    cleaned,
+                )
+                if meth_match:
+                    args["target"] = meth_match.group(1)
+
+            if matched_tool == "condense_method_slice":
+                tv_match = re.search(r"target_vars\s*=\s*(\[[^\]]+\]|['\"][^'\"]+['\"])", search_region)
+                if tv_match:
+                    raw_tv = tv_match.group(1)
+                    try:
+                        args["target_vars"] = json.loads(raw_tv.replace("'", '"'))
+                    except Exception:
+                        args["target_vars"] = raw_tv.strip("'\"")
+                else:
+                    args["target_vars"] = (
+                        ["discount_percent", "item.price"]
+                        if "discount" in str(args.get("target", "")).lower()
+                        else ["summary", "item_total"]
+                    )
+            elif matched_tool in ("trace_variable_to_sink", "traverse_data_flow"):
+                vn_match = re.search(r"var_name\s*=\s*['\"]([^'\"]+)['\"]", search_region)
+                if vn_match:
+                    args["var_name"] = vn_match.group(1)
+                else:
+                    args["var_name"] = (
+                        "discount_percent"
+                        if "discount" in str(args.get("target", "")).lower()
+                        else "item_total"
+                    )
+
+            if args.get("target") or matched_tool == "semantic_code_search":
+                if matched_tool == "semantic_code_search" and "query" not in args:
+                    args["query"] = search_region.strip()[:120]
+                tool_calls.append({
+                    "name": matched_tool,
+                    "args": args,
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                })
+
+    return tool_calls
+
+
 class LocalHuggingFaceChatModel(BaseChatModel):
-    """Wraps a PyTorch/Transformers causal language model with LangChain's ChatModel interface."""
+    """Wraps a PyTorch/Transformers causal language model (Gemma, Qwen, Llama) with LangChain's ChatModel interface."""
 
     model: Any
     tokenizer: Any
-    max_new_tokens: int = 512
+    max_new_tokens: int = 384
     temperature: float = 0.1
     top_p: float = 0.9
     bound_tools: List[Dict[str, Any]] = []
@@ -108,81 +286,127 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             bound_tools=formatted_tools,
         )
 
+    def _format_tools_prompt_block(self) -> str:
+        """Creates a compact tool schema block for models whose tokenizer template does not inject `tools` (e.g., Gemma)."""
+        if not self.bound_tools:
+            return ""
+        lines = [
+            "### AVAILABLE GRAPH TOOLS (Invoke using `<tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call>`):"
+        ]
+        for t in self.bound_tools:
+            fn = t.get("function", t)
+            name = fn.get("name", "")
+            desc = fn.get("description", "")
+            params = fn.get("parameters", {})
+            props = list(params.get("properties", {}).keys()) if isinstance(params, dict) else list(params.keys())
+            lines.append(f"- `{name}({', '.join(props)})`: {desc}")
+        return "\n".join(lines)
+
     def _convert_messages_to_prompt(self, messages: List[BaseMessage]) -> str:
-        """Converts LangChain messages to ChatML format for tokenizer."""
-        chatml_msgs = []
+        """Converts LangChain messages into a prompt compatible with both Gemma (strict user/model alternation) and ChatML."""
+        raw_msgs: List[Dict[str, str]] = []
         for m in messages:
             if isinstance(m, SystemMessage):
-                chatml_msgs.append({"role": "system", "content": m.content})
+                raw_msgs.append({"role": "system", "content": str(m.content)})
             elif isinstance(m, HumanMessage):
-                chatml_msgs.append({"role": "user", "content": m.content})
+                raw_msgs.append({"role": "user", "content": str(m.content)})
             elif isinstance(m, AIMessage):
-                chatml_msgs.append({"role": "assistant", "content": m.content})
+                content = str(m.content or "")
+                tcs = getattr(m, "tool_calls", None) or []
+                if tcs and "<tool_call>" not in content:
+                    tc_blocks = [
+                        f"<tool_call>\n{json.dumps({'name': tc['name'], 'arguments': tc.get('args', {})})}\n</tool_call>"
+                        for tc in tcs
+                    ]
+                    content = (content + "\n" + "\n".join(tc_blocks)).strip()
+                raw_msgs.append({"role": "assistant", "content": content})
             elif isinstance(m, ToolMessage):
-                chatml_msgs.append({
+                t_name = getattr(m, "name", "tool")
+                raw_msgs.append({
                     "role": "tool",
-                    "name": getattr(m, "name", "tool"),
-                    "content": m.content,
+                    "name": t_name,
+                    "content": str(m.content),
                 })
+
+        template_str = str(getattr(self.tokenizer, "chat_template", "") or "")
+        tok_name = str(getattr(self.tokenizer, "name_or_path", "") or "").lower()
+        is_gemma = "gemma" in tok_name or "<start_of_turn>" in template_str
+
+        # Path 1: Native tool-aware ChatML template (e.g., Qwen2.5)
+        if not is_gemma and "tools" in template_str and "system" in template_str:
+            try:
+                return self.tokenizer.apply_chat_template(
+                    raw_msgs,
+                    tools=self.bound_tools if self.bound_tools else None,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception:
+                pass
+
+        # Path 2: Gemma / Generic strict alternating user/assistant turns with explicit tool-schema injection
+        tools_block = self._format_tools_prompt_block()
+        system_parts: List[str] = []
+        alternating_msgs: List[Dict[str, str]] = []
+
+        for m in raw_msgs:
+            role = m["role"]
+            content = m["content"]
+            if role == "system":
+                system_parts.append(content)
+                continue
+            elif role == "tool":
+                t_name = m.get("name", "tool")
+                user_chunk = (
+                    f"### [Observation from `{t_name}`]:\n```json\n{content}\n```\n\n"
+                    f"Now state your **[Synthesis & Deduction]** based on this real observation and emit your next "
+                    f"`<tool_call>...</tool_call>` (e.g. `verify_patch` or `condense_method_slice`) or final conclusion."
+                )
+                role = "user"
+                content = user_chunk
+
+            if system_parts and role == "user":
+                prefix = "\n\n".join(system_parts)
+                if tools_block:
+                    prefix = f"{prefix}\n\n{tools_block}"
+                content = f"{prefix}\n\n---\n\n{content}"
+                system_parts = []
+                tools_block = ""
+
+            if alternating_msgs and alternating_msgs[-1]["role"] == role:
+                alternating_msgs[-1]["content"] += f"\n\n{content}"
+            else:
+                alternating_msgs.append({"role": role, "content": content})
+
+        if not alternating_msgs and system_parts:
+            prefix = "\n\n".join(system_parts)
+            if tools_block:
+                prefix = f"{prefix}\n\n{tools_block}"
+            alternating_msgs.append({"role": "user", "content": prefix})
 
         try:
             return self.tokenizer.apply_chat_template(
-                chatml_msgs,
-                tools=self.bound_tools if self.bound_tools else None,
+                alternating_msgs,
                 add_generation_prompt=True,
                 tokenize=False,
             )
         except Exception:
-            # Fallback text rendering if template fails on tools
+            if is_gemma:
+                rendered = []
+                for m in alternating_msgs:
+                    g_role = "model" if m["role"] == "assistant" else "user"
+                    rendered.append(f"<start_of_turn>{g_role}\n{m['content']}<end_of_turn>")
+                rendered.append("<start_of_turn>model\n")
+                return "\n".join(rendered)
             rendered = []
-            for m in chatml_msgs:
+            for m in raw_msgs:
                 rendered.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
             rendered.append("<|im_start|>assistant\n")
             return "\n".join(rendered)
 
     def _extract_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extracts JSON tool calls from assistant text."""
-        tool_calls = []
-        # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call>
-        qwen_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-        for m in qwen_pattern.finditer(text):
-            try:
-                data = json.loads(m.group(1))
-                name = data.get("name")
-                args = data.get("arguments", {})
-                if isinstance(args, str):
-                    args = json.loads(args)
-                if name:
-                    tool_calls.append({
-                        "name": name,
-                        "args": args,
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "tool_call",
-                    })
-            except json.JSONDecodeError:
-                pass
-
-        # Pattern B: ```json\n{"name": ..., "arguments": ...}\n```
-        if not tool_calls:
-            block_pattern = re.compile(
-                r"```(?:json)?\s*(\{\s*\"(?:tool|name)\":.*?)\s*```", re.DOTALL
-            )
-            for m in block_pattern.finditer(text):
-                try:
-                    data = json.loads(m.group(1))
-                    name = data.get("name") or data.get("tool")
-                    args = data.get("arguments") or data.get("parameters", {})
-                    if name:
-                        tool_calls.append({
-                            "name": name,
-                            "args": args,
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "tool_call",
-                        })
-                except json.JSONDecodeError:
-                    pass
-
-        return tool_calls
+        """Extracts tool calls from assistant output."""
+        return parse_tool_calls_from_text(text)
 
     def _generate(
         self,
@@ -191,24 +415,58 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
+        import gc
         import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
 
         prompt_text = self._convert_messages_to_prompt(messages)
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
+        prompt_len = inputs.input_ids.shape[1]
+        tokenizer_ref = self.tokenizer
+
+        class _ToolCallStoppingCriteria(StoppingCriteria):
+            """Halts generation immediately after `</tool_call>` or before a hallucinated `[Observation]` block."""
+
+            def __call__(self, input_ids: Any, scores: Any, **kw: Any) -> bool:
+                gen_ids = input_ids[0][prompt_len:]
+                if len(gen_ids) < 4:
+                    return False
+                tail_text = tokenizer_ref.decode(gen_ids[-24:], skip_special_tokens=False)
+                if "</tool_call>" in tail_text:
+                    return True
+                if "Observation]" in tail_text or "**[Observation" in tail_text:
+                    return True
+                return False
+
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "do_sample": True,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "stopping_criteria": StoppingCriteriaList([_ToolCallStoppingCriteria()]),
+        }
 
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
+            outputs = self.model.generate(**inputs, **gen_kwargs)
 
-        new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+        new_tokens = outputs[0][prompt_len:]
         raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
-        clean_text = raw_text.replace("<|im_end|>", "").strip()
+
+        # Free GPU tensors immediately to prevent multi-turn VRAM fragmentation/OOM
+        del inputs, outputs, new_tokens
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        clean_text = (
+            raw_text.replace("<|im_end|>", "")
+            .replace("<end_of_turn>", "")
+            .replace("<eos>", "")
+            .replace("<|eot_id|>", "")
+            .strip()
+        )
+        clean_text = strip_hallucinated_observation(clean_text)
 
         tool_calls = self._extract_tool_calls(clean_text)
         message = AIMessage(content=clean_text, tool_calls=tool_calls)

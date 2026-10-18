@@ -285,3 +285,27 @@ class TestLangGraphAgent:
         tool_msgs = [m for m in result["messages"] if hasattr(m, "tool_call_id")]
         assert len(tool_msgs) >= 2
         assert "System Error: You have already inspected this node" in tool_msgs[1].content
+
+    def test_gemma_hallucinated_observation_stripping_and_action_parsing(self):
+        """Verifies that Gemma outputs with natural-language [Action] and hallucinated [Observation] are cleaned and parsed."""
+        from agent_langchain import parse_tool_calls_from_text, strip_hallucinated_observation
+
+        raw_gemma_output = (
+            "Okay, let's begin.\n\n"
+            "**[Hypothesis]**: The `apply_discount` method is likely the source of the incorrect discount calculation.\n\n"
+            "**[Action]**: `traverse_ast` on `InventoryManager.apply_discount` (Node #107374182415, Line 76).\n\n"
+            "**[Observation]**:\n"
+            "```json\n"
+            "{\"method_name\": \"InventoryManager.apply_discount\", \"ast\": []}\n"
+            "```\n\n"
+            "**[Action]**: `traverse_cfg`"
+        )
+        cleaned = strip_hallucinated_observation(raw_gemma_output)
+        assert "**[Observation]**" not in cleaned
+        assert "discounted_price" not in cleaned
+
+        calls = parse_tool_calls_from_text(raw_gemma_output)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "traverse_ast"
+        assert calls[0]["args"]["target"] == "InventoryManager.apply_discount"
+

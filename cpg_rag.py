@@ -107,11 +107,17 @@ class CPGSemanticIndex:
         # Try initializing dense embeddings
         self._init_dense_embeddings()
 
+    _SHARED_DENSE_MODELS: Dict[str, Any] = {}
+
     def _init_dense_embeddings(self) -> None:
-        """Tries to initialize SentenceTransformer; falls back to lexical + mutation scoring if unavailable."""
+        """Tries to initialize SentenceTransformer on CPU; falls back to lexical + mutation scoring if unavailable."""
         try:
             from sentence_transformers import SentenceTransformer
-            self._dense_model = SentenceTransformer(self.model_name)
+            if self.model_name not in self._SHARED_DENSE_MODELS:
+                self._SHARED_DENSE_MODELS[self.model_name] = SentenceTransformer(
+                    self.model_name, device="cpu"
+                )
+            self._dense_model = self._SHARED_DENSE_MODELS[self.model_name]
             doc_texts = [d["semantic_text"] for d in self.documents]
             self._dense_embeddings = self._dense_model.encode(doc_texts, convert_to_tensor=True)
             self._use_dense = True

@@ -9,11 +9,15 @@ the Graph-of-Thoughts reasoning loop to find and diagnose bugs.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
 from agent_tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
@@ -25,7 +29,9 @@ try:
     from agent_langchain import (
         LocalHuggingFaceChatModel,
         MockGoTChatModel,
+        parse_tool_calls_from_text,
         run_langgraph_agent_loop,
+        strip_hallucinated_observation,
     )
     LANGCHAIN_AVAILABLE = True
 except ImportError:
@@ -37,13 +43,15 @@ except ImportError:
 # ==============================================================================
 
 def load_quantized_model(
-    model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    model_name: str = "google/gemma-2-2b-it",
     quantization: str = "4bit",
     device_map: str = "auto",
 ) -> Tuple[Any, Any]:
-    """Loads a state-of-the-art coding model with 4-bit or 8-bit quantization.
+    """Loads a lightweight coding/instruction model (default: Gemma) with 4-bit or 8-bit quantization.
 
     Optimized for Google Colab (T4 / A100 GPU) to fit comfortably in VRAM.
+    Automatically frees stale CUDA cache and falls back to ungated `unsloth/`
+    mirrors if a `google/gemma-*` repo is gated without an active HF token.
     """
     try:
         import torch
@@ -53,11 +61,22 @@ def load_quantized_model(
         print("    In Colab, install with: pip install torch transformers bitsandbytes accelerate", file=sys.stderr)
         sys.exit(1)
 
+    # Free any stale tensors / cached blocks before allocating a new model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print(f"[*] Loading model '{model_name}' with {quantization} quantization...")
+
+    # Use float16 on T4 GPUs (compute capability < 8.0), bfloat16 only on Ampere+ (A100/L4)
+    compute_dtype = torch.float16
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability(0)
+        if major >= 8 and torch.cuda.is_bf16_supported():
+            compute_dtype = torch.bfloat16
 
     bnb_config = None
     if quantization == "4bit":
-        compute_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -67,20 +86,36 @@ def load_quantized_model(
     elif quantization == "8bit":
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    candidate_names = [model_name]
+    if model_name.startswith("google/gemma"):
+        candidate_names.append(model_name.replace("google/", "unsloth/", 1))
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map=device_map,
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
+    last_err: Optional[Exception] = None
+    for cand_name in candidate_names:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(cand_name, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[+] Model '{model_name}' successfully loaded in {quantization} mode.")
-    return model, tokenizer
+            model = AutoModelForCausalLM.from_pretrained(
+                cand_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                torch_dtype=compute_dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+            print(f"[+] Model '{cand_name}' successfully loaded in {quantization} mode.")
+            return model, tokenizer
+        except Exception as exc:
+            last_err = exc
+            if cand_name != candidate_names[-1]:
+                print(
+                    f"[!] Could not load '{cand_name}' ({exc}). "
+                    f"Falling back to ungated mirror '{candidate_names[-1]}'..."
+                )
+
+    raise RuntimeError(f"Failed to load model '{model_name}': {last_err}") from last_err
 
 
 # ==============================================================================
@@ -88,10 +123,12 @@ def load_quantized_model(
 # ==============================================================================
 
 def extract_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """Extracts tool calls from model output supporting Qwen2.5 and standard formats."""
-    tool_calls = []
+    """Extracts tool calls from model output supporting Gemma, Qwen2.5, and standard formats."""
+    if LANGCHAIN_AVAILABLE:
+        parsed = parse_tool_calls_from_text(text)
+        return [{"name": tc["name"], "arguments": tc.get("args", {})} for tc in parsed]
 
-    # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call>
+    tool_calls = []
     qwen_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
     for m in qwen_pattern.finditer(text):
         try:
@@ -104,20 +141,6 @@ def extract_tool_calls(text: str) -> List[Dict[str, Any]]:
                 tool_calls.append({"name": name, "arguments": args})
         except json.JSONDecodeError:
             pass
-
-    # Pattern B: ```json\n{"name": ..., "parameters": ...}\n```
-    if not tool_calls:
-        block_pattern = re.compile(r"```(?:json)?\s*(\{\s*\"(?:tool|name)\":.*?)\s*```", re.DOTALL)
-        for m in block_pattern.finditer(text):
-            try:
-                data = json.loads(m.group(1))
-                name = data.get("name") or data.get("tool")
-                args = data.get("arguments") or data.get("parameters", {})
-                if name:
-                    tool_calls.append({"name": name, "arguments": args})
-            except json.JSONDecodeError:
-                pass
-
     return tool_calls
 
 
@@ -132,7 +155,11 @@ def run_agent_loop(
     problem_prompt: str,
     max_turns: int = 6,
 ) -> str:
-    """Executes the multi-turn Graph of Thoughts debugging agent loop."""
+    """Executes the multi-turn Graph of Thoughts debugging agent loop (compatible with Gemma & Qwen)."""
+    if LANGCHAIN_AVAILABLE:
+        chat_model = LocalHuggingFaceChatModel(model=model, tokenizer=tokenizer)
+        return run_langgraph_agent_loop(chat_model, graph, problem_prompt, max_turns=max_turns)
+
     import torch
 
     # Reset stateful tool execution memory buffer
@@ -146,8 +173,7 @@ def run_agent_loop(
             problem_prompt = f"{problem_prompt}\n\n{ep_block}"
 
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": GRAPH_OF_THOUGHTS_SYSTEM_PROMPT},
-        {"role": "user", "content": problem_prompt},
+        {"role": "user", "content": f"{GRAPH_OF_THOUGHTS_SYSTEM_PROMPT}\n\n---\n\n{problem_prompt}"},
     ]
 
     print("\n" + "=" * 60)
@@ -157,43 +183,51 @@ def run_agent_loop(
     for turn in range(1, max_turns + 1):
         print(f"\n--- [Turn {turn}/{max_turns}] Generating reasoning & actions ---")
 
-        # Format input using ChatML with tools
         prompt_text = tokenizer.apply_chat_template(
             messages,
-            tools=TOOLS_SCHEMA,
             add_generation_prompt=True,
             tokenize=False,
         )
 
         inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        prompt_len = inputs.input_ids.shape[1]
 
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=384,
                 temperature=0.1,
                 top_p=0.9,
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
             )
 
-        new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+        new_tokens = outputs[0][prompt_len:]
         response_text = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        del inputs, outputs, new_tokens
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # Clean display
-        clean_response = response_text.replace("<|im_end|>", "").strip()
+        clean_response = (
+            response_text.replace("<|im_end|>", "")
+            .replace("<end_of_turn>", "")
+            .replace("<eos>", "")
+            .strip()
+        )
+        if LANGCHAIN_AVAILABLE:
+            clean_response = strip_hallucinated_observation(clean_response)
         print(f"[Model Output]:\n{clean_response}\n")
 
         messages.append({"role": "assistant", "content": clean_response})
 
-        # Detect tool calls
         tool_calls = extract_tool_calls(clean_response)
 
         if not tool_calls:
             print("[+] Model finished reasoning and provided final deduction.")
             return clean_response
 
-        # Execute all tool calls against the Code Property Graph
+        obs_chunks = []
         for tc in tool_calls:
             t_name = tc["name"]
             t_args = tc.get("arguments", {})
@@ -202,15 +236,14 @@ def run_agent_loop(
             result = dispatch_tool(graph, t_name, t_args)
             result_str = json.dumps(result, indent=2)
 
-            # Summarize output for terminal
             line_count = len(result_str.splitlines())
             print(f"    -> Returned {line_count} lines of graph properties.")
+            obs_chunks.append(f"### [Observation from `{t_name}`]:\n```json\n{result_str}\n```")
 
-            messages.append({
-                "role": "tool",
-                "name": t_name,
-                "content": result_str,
-            })
+        messages.append({
+            "role": "user",
+            "content": "\n\n".join(obs_chunks),
+        })
 
     return messages[-1]["content"]
 
@@ -346,8 +379,8 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-Coder-7B-Instruct",
-        help="HuggingFace model ID (default: Qwen/Qwen2.5-Coder-7B-Instruct)",
+        default="google/gemma-2-2b-it",
+        help="HuggingFace model ID (default: google/gemma-2-2b-it)",
     )
     parser.add_argument(
         "--quantization",

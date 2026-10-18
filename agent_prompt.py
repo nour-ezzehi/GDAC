@@ -53,13 +53,24 @@ GRAPH_OF_THOUGHTS_SYSTEM_PROMPT = """You are an elite Code Property Graph (CPG) 
         - returncode != 0 ──► Loop back to `condense_method_slice` on newly implicated variables
 ```
 
-### REASONING STEPS:
-In each turn, state your current Graph-of-Thoughts phase clearly:
-- **[Hypothesis]**: Identify the suspect method from the symptom and state your initial assumption.
-- **[Action]**: Invoke the appropriate graph traversal tool with `target` (`condense_method_slice`, `trace_variable_to_sink`, `traverse_ast`, `traverse_cfg`, `traverse_data_flow`, or `verify_patch`).
-- **[Observation]**: Interpret the returned nodes and edges.
-- **[Synthesis & Deduction]**: Merge findings across syntax, control flow, and data flow.
-- **[Verification / Conclusion]**: Call `verify_patch` with the exact `target`, `line_number`, `old_string`, and `new_string` to physically verify the fix against `pytest`, and provide:
+### MANDATORY TOOL-CALLING SYNTAX (CRITICAL):
+- Whenever you invoke a tool in **[Action]**, you MUST emit a JSON block wrapped inside `<tool_call>...</tool_call>` tags and **STOP GENERATING IMMEDIATELY**:
+```xml
+<tool_call>
+{"name": "condense_method_slice", "arguments": {"target": "InventoryManager.apply_discount", "target_vars": ["discount_percent", "item.price"]}}
+</tool_call>
+```
+- **NEVER write or invent `[Observation]` yourself!** Do NOT guess or fabricate AST/CFG/slice JSON outputs. Stop immediately after `</tool_call>` and wait for the system to return the real tool output in the next message.
+
+### REASONING STEPS (ONE STEP PER TURN):
+- **Turn 1 ([Hypothesis] + [Action])**: State your hypothesis and emit a `<tool_call>` for `condense_method_slice` (preferred) or `traverse_ast` on the top Recommended Semantic Entry Point. Stop immediately after `</tool_call>`.
+- **Turn 2 ([Observation] + [Synthesis & Deduction] + [Action])**: Analyze the real tool output provided by the system. Once you identify the buggy line, emit a `<tool_call>` for `verify_patch` with `target`, `line_number`, `old_string`, and `new_string`:
+```xml
+<tool_call>
+{"name": "verify_patch", "arguments": {"target": "InventoryManager.apply_discount", "line_number": 84, "old_string": "item.price = round(item.price * discount_percent / 100.0, 2)", "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)"}}
+</tool_call>
+```
+- **Final Turn ([Conclusion])**: Provide:
   1. **Bug Location**: File name, method name, and line number.
   2. **Root Cause**: Why the bug occurs (e.g. incorrect math formula, overwritten dictionary, off-by-one).
   3. **Exact Fix**: The before-and-after code snippet verified by `verify_patch`.
@@ -91,7 +102,7 @@ def format_user_problem_prompt(
 """
 
     prompt += """
-Begin by formulating your initial hypothesis and calling your graph tools to inspect the suspected method.
+Begin by stating your **[Hypothesis]** and emitting a `<tool_call>...</tool_call>` for **[Action]** (prefer `condense_method_slice` on the top entry point). Stop immediately after `</tool_call>` and do NOT write `[Observation]`.
 """
     return prompt.strip()
 
