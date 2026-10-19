@@ -548,8 +548,8 @@ def verify_patch(
     original_content = file_path.read_text(encoding="utf-8")
     all_lines = original_content.splitlines()
 
-    old_clean = (old_string or "").strip()
-    new_clean = (new_string or "").strip()
+    old_clean = re.sub(r"^L\d+\s*:\s*", "", (old_string or "").strip())
+    new_clean = re.sub(r"^L\d+\s*:\s*", "", (new_string or "").strip())
     if not old_clean or not new_clean:
         return {
             "tool": "verify_patch",
@@ -560,6 +560,24 @@ def verify_patch(
             "line_number": line_number,
             "materialized_window": window_info["numbered_window"],
             "hint": "Provide non-empty old_string and new_string from the 15-line materialized window.",
+        }
+
+    if old_clean == new_clean:
+        return {
+            "tool": "verify_patch",
+            "status": "FAILED",
+            "returncode": -1,
+            "target": str(target),
+            "method_id": method_id,
+            "file_path": str(file_path),
+            "line_number": line_number,
+            "materialized_window": window_info["numbered_window"],
+            "error": (
+                f"Invalid no-op patch: `old_string` and `new_string` are identical ({old_clean!r}). "
+                f"Inspect `materialized_window` (L{window_info['start_line']}-L{window_info['end_line']}), "
+                f"select the exact buggy statement line number inside the method body, and provide a modified `new_string`."
+            ),
+            "implicated_variables": _extract_implicated_variables(old_clean, graph, method_id),
         }
 
     # Step 2: Surgical Diff within the 15-line materialized window
@@ -999,8 +1017,9 @@ def dispatch_tool(
                 "target": target_display,
                 "method_id": slice_res["method_id"],
                 "target_vars": slice_res["target_vars"],
-                "method_summary": slice_res["method_summary"],
+                "slice_lines": slice_res["slice_text"].splitlines(),
                 "slice_text": slice_res["slice_text"],
+                "method_summary": slice_res["method_summary"],
                 "interprocedural_links": slice_res.get("interprocedural_links", []),
                 "token_stats": slice_res["token_stats"],
             }

@@ -477,11 +477,19 @@ def _reconstruct_statement_code(
         ch_list = ast_children.get(stmt_id, [])
         if len(ch_list) == 2 and str(G.nodes.get(ch_list[1], {}).get("label", "")) == "BLOCK":
             lhs_c = str(G.nodes.get(ch_list[0], {}).get("code", "")).strip()
-            rhs_sub = [
-                str(G.nodes.get(sub_c, {}).get("code", "")).strip()
-                for sub_c in ast_children.get(ch_list[1], [])
-                if str(G.nodes.get(sub_c, {}).get("label", "")) not in ("IDENTIFIER", "LOCAL")
-            ]
+            rhs_sub = []
+            for sub_c in ast_children.get(ch_list[1], []):
+                sub_data = G.nodes.get(sub_c, {})
+                sub_lbl = str(sub_data.get("label", ""))
+                if sub_lbl in ("IDENTIFIER", "LOCAL"):
+                    continue
+                sub_code = str(sub_data.get("code", "")).strip()
+                if sub_lbl == "<operator>.assignment" and "=" in sub_code:
+                    lhs_p, rhs_p = sub_code.split("=", 1)
+                    if _COMPILER_TEMP_RE.match(lhs_p.strip()):
+                        sub_code = rhs_p.strip()
+                if sub_code:
+                    rhs_sub.append(sub_code)
             if lhs_c and rhs_sub:
                 raw_code = f"{lhs_c} {_BINARY_OP_SYMBOLS[s_lbl]} {rhs_sub[-1]}"
 

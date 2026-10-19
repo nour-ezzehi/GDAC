@@ -337,4 +337,32 @@ class TestLangGraphAgent:
         assert "slice_text" in parsed
         assert "method_summary" in parsed
         assert "generate_category_summary" in parsed["slice_text"]
+        assert "summary = {}" in parsed["slice_text"]
+        assert "summary = {} = {}" not in parsed["slice_text"]
+
+        # Verify malformed ```tool_call> with missing closing `}` is parsed cleanly
+        from agent_langchain import parse_tool_calls_from_text
+        malformed_turn3 = (
+            "```tool_call>\n"
+            '{"name": "condense_method_slice", "arguments": {"target": "InventoryReporter.generate_category_summary", "target_vars": ["summary", "item", "item_total", "summary[item.category]"]}\n'
+            "</tool_call>"
+        )
+        parsed_calls = parse_tool_calls_from_text(malformed_turn3)
+        assert len(parsed_calls) == 1
+        assert parsed_calls[0]["name"] == "condense_method_slice"
+        assert parsed_calls[0]["args"]["target"] == "InventoryReporter.generate_category_summary"
+
+        # Verify no-op verify_patch (old_string == new_string) is rejected with clear message
+        noop_out = json.loads(
+            tools_by_name["verify_patch"].invoke(
+                {
+                    "target": "InventoryReporter.generate_category_summary",
+                    "line_number": 31,
+                    "old_string": "summary = {}",
+                    "new_string": "summary = {}",
+                }
+            )
+        )
+        assert noop_out["status"] == "FAILED"
+        assert "identical" in noop_out["error"]
 

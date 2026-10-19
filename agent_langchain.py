@@ -77,7 +77,13 @@ _KNOWN_CPG_TOOLS = (
 
 
 def strip_hallucinated_observation(text: str) -> str:
-    """Truncates assistant output right after `</tool_call>` or before any self-generated `[Observation]` block."""
+    """Truncates assistant output right after `</tool_call>` or before any self-generated `[Observation]` block,
+    and normalizes malformed markdown-fenced `<tool_call>` tags.
+    """
+    # Normalize ```xml\n<tool_call> or ```tool_call> into clean <tool_call>
+    text = re.sub(r"```(?:xml|json|tool_call)?\s*<tool_call>", "<tool_call>", text)
+    text = re.sub(r"```+\s*tool_call>", "<tool_call>", text)
+
     if "</tool_call>" in text:
         idx = text.rfind("</tool_call>") + len("</tool_call>")
         return text[:idx].strip()
@@ -93,20 +99,53 @@ def strip_hallucinated_observation(text: str) -> str:
     return text.strip()
 
 
+def _try_parse_json_dict(raw_str: str) -> Optional[Dict[str, Any]]:
+    """Parses a JSON object string, automatically balancing missing trailing `]` or `}` from lightweight 2B models."""
+    s = raw_str.strip()
+    if not s.startswith("{"):
+        return None
+    for candidate in (
+        s,
+        s + "}",
+        s + "]}",
+        s + '"}',
+        s + '"]}',
+    ):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    # Count unbalanced brackets/braces outside strings
+    open_braces = s.count("{") - s.count("}")
+    open_brackets = s.count("[") - s.count("]")
+    if open_braces > 0 or open_brackets > 0:
+        balanced = s + ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+        try:
+            parsed = json.loads(balanced)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
     """Extracts tool calls from assistant output across XML, JSON code blocks, function-call syntax, and natural-language [Action] lines."""
     cleaned = strip_hallucinated_observation(text)
     tool_calls: List[Dict[str, Any]] = []
 
-    # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call>
-    xml_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call> (including malformed ```tool_call> or missing trailing `}`)
+    xml_pattern = re.compile(r"(?:<|```|`|^)\s*tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)
     for m in xml_pattern.finditer(cleaned):
-        try:
-            data = json.loads(m.group(1))
+        data = _try_parse_json_dict(m.group(1))
+        if data:
             name = data.get("name") or data.get("tool")
             args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
             if isinstance(args, str):
-                args = json.loads(args)
+                args = _try_parse_json_dict(args) or {}
             if name:
                 tool_calls.append({
                     "name": name,
@@ -114,22 +153,20 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "tool_call",
                 })
-        except json.JSONDecodeError:
-            pass
 
     # Pattern B: ```json\n{"name": ..., "arguments": ...}\n```
     if not tool_calls:
         block_pattern = re.compile(
-            r"```(?:json|tool_call|xml)?\s*(\{\s*\"(?:tool|name)\":.*?\})\s*```",
+            r"```(?:json|tool_call|xml)?\s*(\{\s*\"(?:tool|name)\":.*?)\s*```",
             re.DOTALL,
         )
         for m in block_pattern.finditer(cleaned):
-            try:
-                data = json.loads(m.group(1))
+            data = _try_parse_json_dict(m.group(1))
+            if data:
                 name = data.get("name") or data.get("tool")
                 args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
                 if isinstance(args, str):
-                    args = json.loads(args)
+                    args = _try_parse_json_dict(args) or {}
                 if name:
                     tool_calls.append({
                         "name": name,
@@ -137,20 +174,18 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
                         "id": f"call_{uuid.uuid4().hex[:8]}",
                         "type": "tool_call",
                     })
-            except json.JSONDecodeError:
-                pass
 
     # Pattern C: Inline JSON object containing "name": "<tool>"
     if not tool_calls:
         inline_json = re.compile(
             r"(\{\s*\"(?:name|tool)\"\s*:\s*\"(?:"
             + "|".join(_KNOWN_CPG_TOOLS)
-            + r")\".*?\}\s*\})",
+            + r")\".*?\}(?:\s*\})?)",
             re.DOTALL,
         )
         for m in inline_json.finditer(cleaned):
-            try:
-                data = json.loads(m.group(1))
+            data = _try_parse_json_dict(m.group(1))
+            if data:
                 name = data.get("name") or data.get("tool")
                 args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
                 if name:
@@ -160,8 +195,6 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
                         "id": f"call_{uuid.uuid4().hex[:8]}",
                         "type": "tool_call",
                     })
-            except json.JSONDecodeError:
-                pass
 
     # Pattern D: Pythonic or Natural-Language [Action] fallback for lightweight 2B/4B Gemma models
     # e.g., `**[Action]**: condense_method_slice(target="InventoryManager.apply_discount", target_vars=["discount_percent"])`
@@ -358,10 +391,37 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                 continue
             elif role == "tool":
                 t_name = m.get("name", "tool")
+                parsed_tool = _try_parse_json_dict(content) or {}
+                extra_code_block = ""
+                follow_up = (
+                    "First write 1-2 sentences of **[Synthesis & Deduction]** identifying the exact buggy statement "
+                    "line `L<num>` inside the method body (do NOT use the `[METHOD]` header line!) and the corrected "
+                    "statement, then emit `<tool_call>...</tool_call>` for `verify_patch`."
+                )
+                if t_name == "condense_method_slice" and parsed_tool.get("slice_text"):
+                    extra_code_block = (
+                        f"### Condensed Method Slice (`{parsed_tool.get('target', '')}`):\n"
+                        f"```python\n{parsed_tool['slice_text']}\n```\n\n"
+                    )
+                elif t_name == "verify_patch" and parsed_tool.get("status") != "SOLVED":
+                    mat_win = parsed_tool.get("materialized_window") or ""
+                    err_reason = parsed_tool.get("error") or "pytest assertion failed"
+                    if mat_win:
+                        extra_code_block = (
+                            f"### Materialized Source Window (`{parsed_tool.get('file_path', '')}`):\n"
+                            f"```python\n{mat_win}\n```\n\n"
+                        )
+                    follow_up = (
+                        f"The previous `verify_patch` failed ({err_reason}). "
+                        f"Inspect the numbered lines above, write 1-2 sentences of **[Synthesis & Deduction]**, "
+                        f"and emit a corrected `<tool_call>...</tool_call>` for `verify_patch` with the exact buggy "
+                        f"`line_number`, `old_string`, and a DIFFERENT `new_string`."
+                    )
+
                 user_chunk = (
+                    f"{extra_code_block}"
                     f"### [Observation from `{t_name}`]:\n```json\n{content}\n```\n\n"
-                    f"Now state your **[Synthesis & Deduction]** based on this real observation and emit your next "
-                    f"`<tool_call>...</tool_call>` (e.g. `verify_patch` or `condense_method_slice`) or final conclusion."
+                    f"{follow_up}"
                 )
                 role = "user"
                 content = user_chunk
@@ -831,7 +891,13 @@ def create_cpg_langgraph_agent(
                                     target_vars=implicated_variables,
                                     token_budget=200,
                                 )
-                                res_data["forced_condense_method_slice"] = reslice_dict
+                                res_data["forced_condense_method_slice"] = {
+                                    "method_id": reslice_dict["method_id"],
+                                    "target_vars": reslice_dict["target_vars"],
+                                    "slice_lines": reslice_dict["slice_text"].splitlines(),
+                                    "slice_text": reslice_dict["slice_text"],
+                                    "method_summary": reslice_dict["method_summary"],
+                                }
                                 tool_output = json.dumps(res_data, indent=2)
                             except Exception:
                                 pass

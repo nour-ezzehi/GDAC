@@ -54,22 +54,23 @@ GRAPH_OF_THOUGHTS_SYSTEM_PROMPT = """You are an elite Code Property Graph (CPG) 
 ```
 
 ### MANDATORY TOOL-CALLING SYNTAX (CRITICAL):
-- Whenever you invoke a tool in **[Action]**, you MUST emit a JSON block wrapped inside `<tool_call>...</tool_call>` tags and **STOP GENERATING IMMEDIATELY**:
-```xml
+- Whenever you invoke a tool in **[Action]**, emit a raw `<tool_call>...</tool_call>` block (do NOT wrap `<tool_call>` in ```xml or ``` backticks) and **STOP GENERATING IMMEDIATELY**:
 <tool_call>
-{"name": "condense_method_slice", "arguments": {"target": "InventoryManager.apply_discount", "target_vars": ["discount_percent", "item.price"]}}
+{"name": "condense_method_slice", "arguments": {"target": "ClassName.method_name", "target_vars": ["var1", "var2"]}}
 </tool_call>
-```
+- Always close every `{` with a matching `}` before `</tool_call>`.
 - **NEVER write or invent `[Observation]` yourself!** Do NOT guess or fabricate AST/CFG/slice JSON outputs. Stop immediately after `</tool_call>` and wait for the system to return the real tool output in the next message.
 
 ### REASONING STEPS (ONE STEP PER TURN):
-- **Turn 1 ([Hypothesis] + [Action])**: State your hypothesis and emit a `<tool_call>` for `condense_method_slice` (preferred) or `traverse_ast` on the top Recommended Semantic Entry Point. Stop immediately after `</tool_call>`.
-- **Turn 2 ([Observation] + [Synthesis & Deduction] + [Action])**: Analyze the real tool output provided by the system. Once you identify the buggy line, emit a `<tool_call>` for `verify_patch` with `target`, `line_number`, `old_string`, and `new_string`:
-```xml
+- **Turn 1 ([Hypothesis] + [Action])**: Write 1 sentence stating your **[Hypothesis]**, then emit `<tool_call>...</tool_call>` for `condense_method_slice` on the `#1` Recommended Semantic Entry Point. Stop immediately after `</tool_call>`.
+- **Turn 2 ([Synthesis & Deduction] + [Action])**:
+  1. First write 1-2 sentences of **[Synthesis & Deduction]** pinpointing the exact buggy statement line `L<num>` inside the method body (NEVER use the `[METHOD] ... # L<num>` header line!) and how to fix it:
+     - For **formula bugs**, fix the arithmetic expression (e.g., `price * (1 - discount / 100.0)` instead of `price * discount / 100.0`).
+     - For **aggregation / dictionary overwrite bugs inside a loop**, accumulate onto the existing category/key total (e.g., `summary[item.category] = round(summary.get(item.category, 0.0) + item_total, 2)` instead of `summary[item.category] = round(item_total, 2)`).
+  2. Then emit `<tool_call>...</tool_call>` for `verify_patch` with the statement's exact `line_number`, `old_string` (without the `L<num>:` prefix), and `new_string` (`new_string` MUST differ from `old_string`):
 <tool_call>
-{"name": "verify_patch", "arguments": {"target": "InventoryManager.apply_discount", "line_number": 84, "old_string": "item.price = round(item.price * discount_percent / 100.0, 2)", "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)"}}
+{"name": "verify_patch", "arguments": {"target": "ClassName.method_name", "line_number": 34, "old_string": "result[k] = round(val, 2)", "new_string": "result[k] = round(result.get(k, 0.0) + val, 2)"}}
 </tool_call>
-```
 - **Final Turn ([Conclusion])**: Provide:
   1. **Bug Location**: File name, method name, and line number.
   2. **Root Cause**: Why the bug occurs (e.g. incorrect math formula, overwritten dictionary, off-by-one).
