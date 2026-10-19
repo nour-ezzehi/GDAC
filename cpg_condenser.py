@@ -1274,11 +1274,7 @@ def condense_method_slice(
         for ch in _build_ast_children_map(cond_G).get(m_id, [])
         if str(cond_G.nodes.get(ch, {}).get("label", "")) == "PARAM"
     ]
-    header_line = (
-        f"[METHOD] {m_name}({', '.join(params)})  # L{m_line}"
-        if m_line
-        else f"[METHOD] {m_name}({', '.join(params)})"
-    )
+    header_line = f"[METHOD] {m_name}({', '.join(params)})"
 
     def _render_slice(
         kept_set: Set[int], include_header: bool = True

@@ -146,19 +146,19 @@ class VerifyPatchInput(BaseModel):
     )
     line_number: int = Field(
         ...,
-        description="Target 1-indexed line number identified during condense_method_slice inspection.",
-    )
-    old_string: str = Field(
-        ...,
-        description="Exact existing statement or line to replace within the 15-line materialized source window.",
+        description="Exact 1-indexed statement line number (e.g. 84 or 34) from condense_method_slice.",
     )
     new_string: str = Field(
         ...,
         description="Replacement statement or line that fixes the bug.",
     )
+    old_string: Optional[str] = Field(
+        None,
+        description="Optional existing statement to replace. If omitted, replaces the line at line_number directly.",
+    )
     test_path: Optional[str] = Field(
         None,
-        description="Optional pytest target path (default: automatically resolves the corresponding test file under stackflow/tests/).",
+        description="Optional test target path.",
     )
 
 
@@ -272,8 +272,8 @@ def create_cpg_langchain_tools(
     def _verify_patch(
         target: str,
         line_number: int,
-        old_string: str,
         new_string: str,
+        old_string: Optional[str] = None,
         test_path: Optional[str] = None,
     ) -> str:
         res = dispatch_tool(
@@ -282,7 +282,7 @@ def create_cpg_langchain_tools(
             {
                 "target": target,
                 "line_number": line_number,
-                "old_string": old_string,
+                "old_string": old_string or "",
                 "new_string": new_string,
                 "test_path": test_path,
             },

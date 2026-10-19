@@ -56,7 +56,12 @@ class CPGSemanticIndex:
                             if eed.get("label") == "AST" and self.graph.nodes[pp].get("label") == "TYPE_DECL":
                                 class_name = self.graph.nodes[pp].get("code", "")
 
-            is_test = class_name.startswith("Test") or code.startswith("test_")
+            is_test = (
+                class_name.startswith("Test")
+                or class_name.endswith("Test")
+                or code.startswith(("test_", "Test"))
+                or code.endswith("Test")
+            )
             line_no = d.get("line_number")
 
             # Extract docstrings from AST literal children
@@ -224,7 +229,8 @@ class CPGSemanticIndex:
         # Exact dotted/arrow expression write bonus (e.g., `item.price` or `acct->balance` in query AND writes)
         query_lower = query.lower()
         exact_write_hit = any(
-            w.lower() in query_lower or w.lower().removeprefix("self.") in query_lower
+            w.lower() in query_lower
+            or w.lower().removeprefix("self.").removeprefix("this.").removeprefix("this->") in query_lower
             for w in writes_list
             if len(w) >= 3
         )
@@ -242,9 +248,8 @@ class CPGSemanticIndex:
         for expr in writes_list + reads_list:
             expr_tokens = self._extract_variable_tokens([expr])
             if expr_tokens & q_var_candidates:
-                # Normalize `self.foo` -> `foo` or keep clean identifier
                 clean_var = expr.strip()
-                if clean_var not in seen_vars and clean_var != "self":
+                if clean_var not in seen_vars and clean_var not in ("self", "this"):
                     seen_vars.add(clean_var)
                     matched_vars.append(clean_var)
 

@@ -313,17 +313,24 @@ def resolve_method_node(graph: nx.MultiDiGraph, method_name: str) -> Optional[in
     return resolve_target_node(graph, method_name)
 
 
+_SUPPORTED_SOURCE_EXTENSIONS = (
+    ".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+    ".java", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs",
+    ".cs", ".rb", ".php", ".kt", ".swift", ".scala",
+)
+
+
 def resolve_method_source_file(
     graph: nx.MultiDiGraph,
     method_id: int,
     repo_root: str | Path = "stackflow",
 ) -> Optional[Path]:
-    """Resolves a CPG METHOD node to its physical source file on disk.
+    """Resolves a CPG METHOD node to its physical source file on disk across any language.
 
-    Because Joern CPG exports may omit explicit filename attributes on AST nodes,
-    this function checks node attributes first and falls back to matching the
-    method's name, enclosing TYPE_DECL class name, and definition line number
-    against repository source files under `repo_root`.
+    Checks CPG node attributes (`filename`, `file`, `filepath`, `full_name`) and ancestor
+    AST nodes first, then falls back to scanning repository source files across all
+    supported programming languages by matching method name, enclosing type/class name,
+    and definition line number.
     """
     base_dir = Path(repo_root)
     if not base_dir.is_absolute():
@@ -333,20 +340,40 @@ def resolve_method_source_file(
     if method_id not in graph:
         return None
 
-    node_data = graph.nodes[method_id]
-    # 1. Direct filename attribute if present
-    for key in ("filename", "file", "filepath"):
-        fname = node_data.get(key)
-        if fname and fname != "empty":
-            cand = base_dir / str(fname)
+    def _try_resolve_relpath(raw_path: str) -> Optional[Path]:
+        if not raw_path or raw_path == "empty" or raw_path.startswith("<"):
+            return None
+        clean_p = raw_path.split(":")[0].strip()
+        if not clean_p or not any(clean_p.endswith(ext) for ext in _SUPPORTED_SOURCE_EXTENSIONS):
+            return None
+        for root_cand in (base_dir, base_dir.parent, Path(__file__).resolve().parent):
+            cand = root_cand / clean_p
             if cand.is_file():
                 return cand
-            cand2 = base_dir.parent / str(fname)
-            if cand2.is_file():
-                return cand2
+        return None
 
-    # 2. Match method name, parent class, and line number in repo_root
+    node_data = graph.nodes[method_id]
+    # 1. Direct filename or full_name attribute on the METHOD node or its AST ancestors
+    curr_check: Optional[int] = method_id
+    visited_anc: Set[int] = set()
+    while curr_check is not None and curr_check not in visited_anc:
+        visited_anc.add(curr_check)
+        cdata = graph.nodes.get(curr_check, {})
+        for key in ("filename", "file", "filepath", "full_name", "code"):
+            resolved = _try_resolve_relpath(str(cdata.get(key) or ""))
+            if resolved is not None:
+                return resolved
+        next_parent = None
+        for p, _, ed in graph.in_edges(curr_check, data=True):
+            if ed.get("label") == "AST":
+                next_parent = p
+                break
+        curr_check = next_parent
+
+    # 2. Match method name, parent class/struct/type, and line number in repo_root across languages
     method_name = str(node_data.get("name") or node_data.get("code") or "").strip()
+    if "::" in method_name:
+        method_name = method_name.split("::")[-1].strip()
     if "." in method_name:
         method_name = method_name.split(".")[-1].strip()
     m_line = node_data.get("line_number")
@@ -370,25 +397,38 @@ def resolve_method_source_file(
     if not base_dir.exists():
         return None
 
-    py_files = sorted(base_dir.rglob("*.py"))
+    source_files = sorted(
+        f for f in base_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() in _SUPPORTED_SOURCE_EXTENSIONS
+    )
     best_file: Optional[Path] = None
     best_score = -1
 
-    def_pattern = re.compile(rf"^\s*def\s+{re.escape(method_name)}\s*\(") if method_name else None
-    cls_pattern = re.compile(rf"^\s*class\s+{re.escape(parent_class)}\b") if parent_class else None
+    # Language-agnostic function/method declaration pattern (Python, Rust, Go, JS/TS, C/C++, Java, C#, Kotlin, Ruby, PHP)
+    def_pattern = (
+        re.compile(
+            rf"(?:^\s*(?:(?:pub|public|private|protected|internal|static|virtual|override|async|inline|constexpr|extern)\s+)*"
+            rf"(?:def|fn|func|function|fun)\s+{re.escape(method_name)}\s*[\(<]"
+            rf"|^\s*[\w:<>\[\]\*&\s]+?\b{re.escape(method_name)}\s*\()"
+        )
+        if method_name
+        else None
+    )
+    cls_pattern = (
+        re.compile(rf"\b(?:class|struct|interface|impl|type|trait|enum|module)\s+{re.escape(parent_class)}\b")
+        if parent_class
+        else None
+    )
 
-    for py_file in py_files:
+    for src_file in source_files:
         try:
-            lines = py_file.read_text(encoding="utf-8").splitlines()
+            lines = src_file.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
 
         score = 0
-        has_class = False
-        if cls_pattern:
-            has_class = any(cls_pattern.search(line) for line in lines)
-            if has_class:
-                score += 10
+        if cls_pattern and any(cls_pattern.search(line) for line in lines):
+            score += 10
 
         for idx, line in enumerate(lines, start=1):
             if def_pattern and def_pattern.search(line):
@@ -401,7 +441,7 @@ def resolve_method_source_file(
                         curr_score += max(0, 30 - dist * 5)
                 if curr_score > best_score:
                     best_score = curr_score
-                    best_file = py_file
+                    best_file = src_file
 
     return best_file
 
@@ -447,7 +487,7 @@ def _extract_implicated_variables(
     graph: Optional[nx.MultiDiGraph] = None,
     method_id: Optional[int] = None,
 ) -> List[str]:
-    """Extracts newly implicated variables from a pytest AssertionError / traceback."""
+    """Extracts newly implicated variables from a test runner failure / assertion output in any language."""
     candidates: List[str] = []
     seen: Set[str] = set()
 
@@ -458,36 +498,38 @@ def _extract_implicated_variables(
         for v in summary.get("writes", []) + summary.get("reads", []):
             method_vars.add(str(v))
 
-    # Extract identifiers from E / assert / traceback code lines
+    # Extract identifiers from assertion/failure lines across Python, C/C++, Java, Go, Rust, JS/TS
     important_lines = [
         line for line in traceback_text.splitlines()
-        if line.strip().startswith(("E ", "> ", "assert ")) or "AssertionError" in line
+        if line.strip().startswith(("E ", "> ", "assert ", "ASSERT_", "EXPECT_", "--- FAIL"))
+        or any(tok in line for tok in ("AssertionError", "AssertionFailed", "panicked at", "expected", "actual", "Check failed"))
     ]
     search_blob = "\n".join(important_lines) if important_lines else traceback_text
 
-    # Match dotted attributes and identifiers (e.g. item.price, summary, discount_percent)
-    var_Regex = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b")
+    # Match dotted attributes (`item.price`) and C/C++ pointer dereferences (`acct->balance`)
+    var_Regex = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:(?:\.|->)[a-zA-Z_][a-zA-Z0-9_]*)?)\b")
     stop_words = {
-        "assert", "AssertionError", "def", "return", "in", "is", "not", "and", "or",
-        "True", "False", "None", "self", "pytest", "approx", "test", "where", "float",
-        "int", "str", "round", "len", "get", "Exception", "Error", "FAILED", " E",
+        "assert", "AssertionError", "def", "fn", "func", "function", "return", "in", "is", "not", "and", "or",
+        "True", "False", "true", "false", "None", "null", "nullptr", "nil", "self", "this", "pytest", "approx",
+        "test", "where", "float", "double", "int", "long", "void", "char", "bool", "str", "string", "round",
+        "len", "get", "Exception", "Error", "FAILED", "FAIL", "E",
     }
 
     # First prioritize variables known in the method's data_flow_summary
     for mv in sorted(method_vars):
-        base_mv = mv.split(".")[-1]
+        base_mv = re.split(r"\.|->", mv)[-1]
         if mv in traceback_text or base_mv in traceback_text:
-            if mv not in seen:
+            if mv not in seen and mv not in ("self", "this"):
                 seen.add(mv)
                 candidates.append(mv)
 
     for m in var_Regex.finditer(search_blob):
         tok = m.group(1)
-        if tok in stop_words or tok.startswith("test_") or tok.startswith("Test"):
+        if tok in stop_words or tok.startswith("test_") or tok.startswith("Test") or tok.endswith("Test"):
             continue
-        if "." in tok:
-            lhs, rhs = tok.split(".", 1)
-            if lhs in stop_words or rhs in ("py", "approx", "get"):
+        if "." in tok or "->" in tok:
+            lhs, rhs = re.split(r"\.|->", tok, maxsplit=1)
+            if lhs in stop_words or rhs in ("py", "c", "cpp", "java", "rs", "go", "js", "ts", "approx", "get"):
                 continue
         if tok not in seen:
             seen.add(tok)
@@ -497,7 +539,7 @@ def _extract_implicated_variables(
     if graph is not None and method_id is not None and method_id in graph:
         summary = graph.nodes[method_id].get("data_flow_summary", {})
         for w in summary.get("writes", []):
-            if w not in seen:
+            if w not in seen and w not in ("self", "this"):
                 seen.add(w)
                 candidates.append(w)
 
@@ -550,7 +592,7 @@ def verify_patch(
 
     old_clean = re.sub(r"^L\d+\s*:\s*", "", (old_string or "").strip())
     new_clean = re.sub(r"^L\d+\s*:\s*", "", (new_string or "").strip())
-    if not old_clean or not new_clean:
+    if not new_clean:
         return {
             "tool": "verify_patch",
             "status": "MATERIALIZED",
@@ -559,8 +601,13 @@ def verify_patch(
             "file_path": str(file_path),
             "line_number": line_number,
             "materialized_window": window_info["numbered_window"],
-            "hint": "Provide non-empty old_string and new_string from the 15-line materialized window.",
+            "hint": "Provide line_number and new_string to replace the target line in the 15-line materialized window.",
         }
+
+    # When old_string is omitted, default to the exact line at line_number on disk
+    if not old_clean and 1 <= line_number <= len(all_lines):
+        old_clean = all_lines[line_number - 1].strip()
+        old_string = old_clean
 
     if old_clean == new_clean:
         return {
@@ -642,18 +689,47 @@ def verify_patch(
             "implicated_variables": _extract_implicated_variables(old_clean, graph, method_id),
         }
 
-    # Resolve pytest target path
+    # Resolve test target and language-appropriate test runner command
     project_root = Path(__file__).resolve().parent
-    if test_path:
-        resolved_test = Path(test_path)
-        if not resolved_test.is_absolute():
-            resolved_test = project_root / resolved_test
-    else:
-        module_test = file_path.parent.parent / "tests" / f"test_{file_path.stem}.py"
-        if module_test.is_file():
-            resolved_test = module_test
+    ext = file_path.suffix.lower()
+    resolved_test: Any = test_path or ""
+    cmd: List[str] = []
+
+    if ext == ".py":
+        if test_path:
+            resolved_test_path = Path(test_path)
+            if not resolved_test_path.is_absolute():
+                resolved_test_path = project_root / resolved_test_path
         else:
-            resolved_test = file_path.parent.parent / "tests"
+            module_test = file_path.parent.parent / "tests" / f"test_{file_path.stem}.py"
+            if module_test.is_file():
+                resolved_test_path = module_test
+            else:
+                resolved_test_path = file_path.parent.parent / "tests"
+        resolved_test = str(resolved_test_path)
+        cmd = [sys.executable, "-m", "pytest", resolved_test, "-v", "--tb=short"]
+    elif ext == ".go":
+        resolved_test = test_path or "./..."
+        cmd = ["go", "test", "-v", str(resolved_test)]
+    elif ext == ".rs":
+        resolved_test = test_path or "cargo test"
+        cmd = ["cargo", "test"] + ([str(test_path)] if test_path else [])
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        resolved_test = test_path or "npm test"
+        cmd = ["npm", "test"] + ([str(test_path)] if test_path else [])
+    elif ext == ".java":
+        resolved_test = test_path or "mvn test"
+        if (project_root / "gradlew").is_file() or (project_root / "build.gradle").is_file():
+            cmd = ["gradle", "test"]
+        else:
+            cmd = ["mvn", "test"]
+    else:
+        # C / C++ / generic build systems (CTest / Make)
+        resolved_test = test_path or "ctest"
+        if (project_root / "CMakeLists.txt").is_file():
+            cmd = ["ctest", "--output-on-failure"]
+        else:
+            cmd = ["make", "test"]
 
     # Step 3: Subprocess Execution with atomic rollback guarantee
     returncode = 1
@@ -662,7 +738,7 @@ def verify_patch(
     try:
         file_path.write_text(patched_content, encoding="utf-8")
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", str(resolved_test), "-v", "--tb=short"],
+            cmd,
             cwd=str(project_root),
             capture_output=True,
             text=True,
@@ -694,11 +770,14 @@ def verify_patch(
             "pytest_output": combined_output,
         }
 
-    # Extract concise AssertionError / failure block
+    # Extract concise assertion / failure block across test runners
     failure_lines = []
     capture = False
     for line in combined_output.splitlines():
-        if line.startswith("___") or line.startswith("E   ") or "AssertionError" in line or "FAILED" in line:
+        if (
+            line.startswith(("___", "E   ", "--- FAIL"))
+            or any(k in line for k in ("AssertionError", "FAILED", "FAIL:", "panicked at", "ASSERT_", "EXPECT_"))
+        ):
             capture = True
         if capture:
             failure_lines.append(line)
@@ -864,7 +943,7 @@ def dispatch_tool(
             df_sum = graph.nodes[method_id].get("data_flow_summary") or {}
             auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
             arguments = dict(arguments)
-            arguments["target_vars"] = [v for v in auto_vars if v != "self"]
+            arguments["target_vars"] = [v for v in auto_vars if v not in ("self", "this")]
 
     # Anti-looping interceptor: check deterministic memory buffer
     mem = memory if memory is not None else GLOBAL_TOOL_MEMORY
@@ -1004,7 +1083,7 @@ def dispatch_tool(
             if not target_vars_arg and method_id is not None and method_id in graph:
                 df_sum = graph.nodes[method_id].get("data_flow_summary") or {}
                 auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
-                target_vars_arg = [v for v in auto_vars if v != "self"]
+                target_vars_arg = [v for v in auto_vars if v not in ("self", "this")]
             token_budget = int(arguments.get("token_budget", 200))
             slice_res = condense_method_slice(
                 graph,

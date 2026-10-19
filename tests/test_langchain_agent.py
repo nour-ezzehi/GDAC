@@ -366,3 +366,33 @@ class TestLangGraphAgent:
         assert noop_out["status"] == "FAILED"
         assert "identical" in noop_out["error"]
 
+        # Verify [METHOD] header does not carry # L<num> comment
+        first_line = parsed["slice_text"].splitlines()[0]
+        assert first_line.startswith("[METHOD]")
+        assert "# L" not in first_line
+
+        # Verify 3-arg verify_patch (without old_string) resolves SOLVED cleanly
+        three_arg_out = json.loads(
+            tools_by_name["verify_patch"].invoke(
+                {
+                    "target": "InventoryReporter.generate_category_summary",
+                    "line_number": 34,
+                    "new_string": "summary[item.category] = round(summary.get(item.category, 0.0) + item_total, 2)",
+                }
+            )
+        )
+        assert three_arg_out["status"] == "SOLVED"
+
+        # Verify LangChain parse_partial_json handles unclosed quote before `}}` from Gemma 2B
+        unclosed_quote_call = (
+            '<tool_call>\n'
+            '{"name": "verify_patch", "arguments": {"target": "InventoryManager.apply_discount", "line_number": 84, "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2) }}\n'
+            '</tool_call>'
+        )
+        partial_calls = parse_tool_calls_from_text(unclosed_quote_call)
+        assert len(partial_calls) == 1
+        assert partial_calls[0]["name"] == "verify_patch"
+        assert partial_calls[0]["args"]["line_number"] == 84
+        assert "1 - discount_percent" in partial_calls[0]["args"]["new_string"]
+
+

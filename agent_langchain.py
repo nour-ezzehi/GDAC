@@ -76,202 +76,82 @@ _KNOWN_CPG_TOOLS = (
 )
 
 
-def strip_hallucinated_observation(text: str) -> str:
-    """Truncates assistant output right after `</tool_call>` or before any self-generated `[Observation]` block,
-    and normalizes malformed markdown-fenced `<tool_call>` tags.
-    """
-    # Normalize ```xml\n<tool_call> or ```tool_call> into clean <tool_call>
-    text = re.sub(r"```(?:xml|json|tool_call)?\s*<tool_call>", "<tool_call>", text)
-    text = re.sub(r"```+\s*tool_call>", "<tool_call>", text)
+from langchain_core.utils.json import parse_json_markdown, parse_partial_json
 
+
+def strip_hallucinated_observation(text: str) -> str:
+    """Truncates assistant output right after `</tool_call>` or before any self-generated `[Observation]` block."""
     if "</tool_call>" in text:
         idx = text.rfind("</tool_call>") + len("</tool_call>")
         return text[:idx].strip()
 
-    # If the model wrote an [Action] and then started hallucinating an [Observation] in the same turn, cut before [Observation]
-    obs_match = re.search(
-        r"(?:\n|^)\s*(?:\*\*|###\s*)\[?Observation\]?(?:\*\*)?\s*:?",
-        text,
-        re.IGNORECASE,
-    )
-    if obs_match:
-        return text[: obs_match.start()].strip()
+    for marker in ("**[Observation]**", "### [Observation", "[Observation]:", "**[Observation]:"):
+        if marker in text:
+            return text[: text.index(marker)].strip()
     return text.strip()
 
 
 def _try_parse_json_dict(raw_str: str) -> Optional[Dict[str, Any]]:
-    """Parses a JSON object string, automatically balancing missing trailing `]` or `}` from lightweight 2B models."""
+    """Uses LangChain's partial JSON parser to parse tool-call dicts without brittle regexes."""
     s = raw_str.strip()
-    if not s.startswith("{"):
+    if "{" not in s:
         return None
-    for candidate in (
-        s,
-        s + "}",
-        s + "]}",
-        s + '"}',
-        s + '"]}',
-    ):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Count unbalanced brackets/braces outside strings
-    open_braces = s.count("{") - s.count("}")
-    open_brackets = s.count("[") - s.count("]")
-    if open_braces > 0 or open_brackets > 0:
-        balanced = s + ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
-        try:
-            parsed = json.loads(balanced)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return None
+    s = s[s.find("{") :]
+    if "</tool_call>" in s:
+        s = s[: s.rfind("</tool_call>")].strip()
+    # If a small model omitted the closing quote before the final `}}`, trim trailing braces so parse_partial_json closes both
+    if s.count('"') % 2 == 1:
+        s = s.rstrip("} \t\r\n")
+    try:
+        parsed = parse_json_markdown(s, parser=parse_partial_json)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
 
 
 def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
-    """Extracts tool calls from assistant output across XML, JSON code blocks, function-call syntax, and natural-language [Action] lines."""
+    """Extracts tool calls from assistant output using LangChain's partial JSON parser."""
     cleaned = strip_hallucinated_observation(text)
     tool_calls: List[Dict[str, Any]] = []
 
-    # Pattern A: <tool_call>{"name": ..., "arguments": ...}</tool_call> (including malformed ```tool_call> or missing trailing `}`)
-    xml_pattern = re.compile(r"(?:<|```|`|^)\s*tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)
-    for m in xml_pattern.finditer(cleaned):
-        data = _try_parse_json_dict(m.group(1))
-        if data:
+    chunks = (
+        cleaned.split("tool_call>")[1:]
+        if "tool_call>" in cleaned
+        else [cleaned]
+    )
+    for chunk in chunks:
+        data = _try_parse_json_dict(chunk)
+        if isinstance(data, dict):
             name = data.get("name") or data.get("tool")
             args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
             if isinstance(args, str):
                 args = _try_parse_json_dict(args) or {}
-            if name:
+            if name in _KNOWN_CPG_TOOLS:
                 tool_calls.append({
                     "name": name,
-                    "args": args,
+                    "args": args if isinstance(args, dict) else {},
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "tool_call",
                 })
 
-    # Pattern B: ```json\n{"name": ..., "arguments": ...}\n```
-    if not tool_calls:
-        block_pattern = re.compile(
-            r"```(?:json|tool_call|xml)?\s*(\{\s*\"(?:tool|name)\":.*?)\s*```",
-            re.DOTALL,
-        )
-        for m in block_pattern.finditer(cleaned):
-            data = _try_parse_json_dict(m.group(1))
-            if data:
-                name = data.get("name") or data.get("tool")
-                args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
-                if isinstance(args, str):
-                    args = _try_parse_json_dict(args) or {}
-                if name:
-                    tool_calls.append({
-                        "name": name,
-                        "args": args,
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "tool_call",
-                    })
-
-    # Pattern C: Inline JSON object containing "name": "<tool>"
-    if not tool_calls:
-        inline_json = re.compile(
-            r"(\{\s*\"(?:name|tool)\"\s*:\s*\"(?:"
-            + "|".join(_KNOWN_CPG_TOOLS)
-            + r")\".*?\}(?:\s*\})?)",
-            re.DOTALL,
-        )
-        for m in inline_json.finditer(cleaned):
-            data = _try_parse_json_dict(m.group(1))
-            if data:
-                name = data.get("name") or data.get("tool")
-                args = data.get("arguments") or data.get("args") or data.get("parameters") or {}
-                if name:
-                    tool_calls.append({
-                        "name": name,
-                        "args": args,
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "tool_call",
-                    })
-
-    # Pattern D: Pythonic or Natural-Language [Action] fallback for lightweight 2B/4B Gemma models
-    # e.g., `**[Action]**: condense_method_slice(target="InventoryManager.apply_discount", target_vars=["discount_percent"])`
-    # or `**[Action]**: traverse_ast on InventoryManager.apply_discount (Node #107374182415)`
-    if not tool_calls:
-        action_split = re.split(
-            r"(?:\*\*|###\s*)\[?Action\]?(?:\*\*)?\s*:?",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        search_region = action_split[-1] if len(action_split) > 1 else cleaned
-        matched_tool = None
+    # Fallback for natural-language `[Action]: <tool_name> on <target>` lines
+    if not tool_calls and "Action]" in cleaned:
+        action_tail = cleaned.split("Action]")[-1]
         for tname in _KNOWN_CPG_TOOLS:
-            if re.search(rf"\b{re.escape(tname)}\b", search_region):
-                matched_tool = tname
+            if tname in action_tail:
+                tokens = [
+                    tok.strip("`(),.:;\"'")
+                    for tok in action_tail.split()
+                    if "." in tok and not tok.startswith("http")
+                ]
+                if tokens:
+                    tool_calls.append({
+                        "name": tname,
+                        "args": {"target": tokens[0]},
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "tool_call",
+                    })
                 break
-
-        if matched_tool and len(action_split) > 1:
-            args: Dict[str, Any] = {}
-            # 1. Check explicit target="..." or Node #107374182415 or Class.method
-            target_kv = re.search(r"target\s*=\s*['\"]([^'\"]+)['\"]", search_region)
-            node_id_match = re.search(r"#?(1073741\d+)", search_region) or re.search(r"#?(1073741\d+)", cleaned)
-            qual_match = re.search(
-                r"\b([A-Z][A-Za-z0-9_]*\.[a-z_][A-Za-z0-9_]*)\b",
-                search_region,
-            ) or re.search(
-                r"\b([A-Z][A-Za-z0-9_]*\.[a-z_][A-Za-z0-9_]*)\b",
-                cleaned,
-            )
-            if target_kv:
-                args["target"] = target_kv.group(1)
-            elif qual_match:
-                args["target"] = qual_match.group(1)
-            elif node_id_match:
-                args["target"] = node_id_match.group(1)
-            else:
-                meth_match = re.search(r"\b(apply_discount|generate_category_summary|total_inventory_value|get_low_stock_items|restock|deduct_stock)\b", search_region) or re.search(
-                    r"\b(apply_discount|generate_category_summary|total_inventory_value|get_low_stock_items|restock|deduct_stock)\b",
-                    cleaned,
-                )
-                if meth_match:
-                    args["target"] = meth_match.group(1)
-
-            if matched_tool == "condense_method_slice":
-                tv_match = re.search(r"target_vars\s*=\s*(\[[^\]]+\]|['\"][^'\"]+['\"])", search_region)
-                if tv_match:
-                    raw_tv = tv_match.group(1)
-                    try:
-                        args["target_vars"] = json.loads(raw_tv.replace("'", '"'))
-                    except Exception:
-                        args["target_vars"] = raw_tv.strip("'\"")
-                else:
-                    args["target_vars"] = (
-                        ["discount_percent", "item.price"]
-                        if "discount" in str(args.get("target", "")).lower()
-                        else ["summary", "item_total"]
-                    )
-            elif matched_tool in ("trace_variable_to_sink", "traverse_data_flow"):
-                vn_match = re.search(r"var_name\s*=\s*['\"]([^'\"]+)['\"]", search_region)
-                if vn_match:
-                    args["var_name"] = vn_match.group(1)
-                else:
-                    args["var_name"] = (
-                        "discount_percent"
-                        if "discount" in str(args.get("target", "")).lower()
-                        else "item_total"
-                    )
-
-            if args.get("target") or matched_tool == "semantic_code_search":
-                if matched_tool == "semantic_code_search" and "query" not in args:
-                    args["query"] = search_region.strip()[:120]
-                tool_calls.append({
-                    "name": matched_tool,
-                    "args": args,
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "tool_call",
-                })
 
     return tool_calls
 
@@ -401,15 +281,15 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                 if t_name == "condense_method_slice" and parsed_tool.get("slice_text"):
                     extra_code_block = (
                         f"### Condensed Method Slice (`{parsed_tool.get('target', '')}`):\n"
-                        f"```python\n{parsed_tool['slice_text']}\n```\n\n"
+                        f"```text\n{parsed_tool['slice_text']}\n```\n\n"
                     )
                 elif t_name == "verify_patch" and parsed_tool.get("status") != "SOLVED":
                     mat_win = parsed_tool.get("materialized_window") or ""
-                    err_reason = parsed_tool.get("error") or "pytest assertion failed"
+                    err_reason = parsed_tool.get("error") or "test assertion failed"
                     if mat_win:
                         extra_code_block = (
                             f"### Materialized Source Window (`{parsed_tool.get('file_path', '')}`):\n"
-                            f"```python\n{mat_win}\n```\n\n"
+                            f"```text\n{mat_win}\n```\n\n"
                         )
                     follow_up = (
                         f"The previous `verify_patch` failed ({err_reason}). "
@@ -797,7 +677,7 @@ def create_cpg_langgraph_agent(
                 if resolved_id is not None and resolved_id in graph:
                     df_sum = graph.nodes[resolved_id].get("data_flow_summary") or {}
                     auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
-                    t_args["target_vars"] = [v for v in auto_vars if v != "self"]
+                    t_args["target_vars"] = [v for v in auto_vars if v not in ("self", "this")]
 
             target = str(t_args.get("target") or "").strip().lower()
             var_key = str(
