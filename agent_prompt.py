@@ -24,13 +24,17 @@ You inspect code slices and verify surgical bug fixes.
 ### Debugging Workflow:
 1. **Inspect Code**: In Turn 1, call `condense_method_slice` on the recommended method to inspect the statements and line numbers.
 2. **Fix & Verify**: Find the buggy line `L<num>` in the slice and call `verify_patch` with the replacement statement.
+   - **CRITICAL**: `new_string` must be the **NEW, CORRECTED code** that fixes the bug. NEVER pass the original buggy line as `new_string`!
+   - In discounts/percentages, fix the formula (e.g. `price * (1 - discount_percent / 100.0)`).
+   - In category summaries/aggregations, accumulate values (e.g. `summary.get(category, 0.0) + item_total`).
+   - Make sure `new_string` is wrapped in balanced double quotes inside the JSON.
 3. **Conclude**: When `verify_patch` returns `SOLVED`, state the bug location, root cause, and final fix.
 
 ### Tool Call Format:
-Emit exactly one `<tool_call>` block per turn and STOP immediately after `</tool_call>`. Do NOT write `[Observation]` yourself.
-<tool_call>
+Emit exactly one tool call block per turn and STOP immediately. Do NOT write `[Observation]` yourself.
+```tool_call
 {"name": "tool_name", "arguments": {"param": "value"}}
-</tool_call>
+```
 """
 
 

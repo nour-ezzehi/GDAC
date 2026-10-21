@@ -621,8 +621,8 @@ def verify_patch(
             "materialized_window": window_info["numbered_window"],
             "error": (
                 f"Invalid no-op patch: `old_string` and `new_string` are identical ({old_clean!r}). "
-                f"Inspect `materialized_window` (L{window_info['start_line']}-L{window_info['end_line']}), "
-                f"select the exact buggy statement line number inside the method body, and provide a modified `new_string`."
+                f"You submitted the exact same line as the fix! You must provide a modified `new_string` that fixes the bug "
+                f"(e.g. adjust the calculation formula or accumulation). Do NOT submit the same line again."
             ),
             "implicated_variables": _extract_implicated_variables(old_clean, graph, method_id),
         }

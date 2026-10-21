@@ -49,8 +49,8 @@ from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
 class CPGDebugState(TypedDict, total=False):
     """The central state of the Graph-of-Thoughts debugging agent."""
     messages: Annotated[List[BaseMessage], add_messages]
-    visited_nodes: Set[int]
-    visited_signatures: Set[Tuple[str, str, str]]
+    visited_nodes: Sequence[int]
+    visited_signatures: Sequence[Tuple[str, str, str]]
     entry_points: List[Dict[str, Any]]
     final_deduction: Optional[str]
     turn_count: int
@@ -59,6 +59,7 @@ class CPGDebugState(TypedDict, total=False):
     max_patch_attempts: int
     failure_tracebacks: List[str]
     implicated_variables: List[str]
+
 
 
 # ==============================================================================
@@ -97,8 +98,10 @@ def _try_parse_json_dict(raw_str: str) -> Optional[Dict[str, Any]]:
     if "{" not in s:
         return None
     s = s[s.find("{") :]
-    if "</tool_call>" in s:
-        s = s[: s.rfind("</tool_call>")].strip()
+    # Strip any trailing xml or markdown tags/fences
+    s = re.sub(r"</?(?:tool_call|xml)>.*$", "", s, flags=re.DOTALL).strip()
+    s = re.sub(r"```.*$", "", s, flags=re.DOTALL).strip()
+
     # If a small model omitted the closing quote before the final `}}`, trim trailing braces so parse_partial_json closes both
     if s.count('"') % 2 == 1:
         s = s.rstrip("} \t\r\n")
@@ -114,11 +117,21 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
     cleaned = strip_hallucinated_observation(text)
     tool_calls: List[Dict[str, Any]] = []
 
-    chunks = (
-        cleaned.split("tool_call>")[1:]
-        if "tool_call>" in cleaned
-        else [cleaned]
-    )
+    # Extract candidate chunks from <tool_call>...</tool_call> and ```tool_call ... ```
+    chunks: List[str] = []
+    for m in re.finditer(r"<tool_call>(.*?)(?:</tool_call>|$)", cleaned, re.DOTALL):
+        chunks.append(m.group(1).strip())
+    for m in re.finditer(r"```(?:tool_call|json)?\s*\n(.*?)(?:```|$)", cleaned, re.DOTALL):
+        chunks.append(m.group(1).strip())
+
+    if not chunks:
+        chunks = (
+            cleaned.split("tool_call>")[1:]
+            if "tool_call>" in cleaned
+            else [cleaned]
+        )
+
+    seen_calls = set()
     for chunk in chunks:
         data = _try_parse_json_dict(chunk)
         if isinstance(data, dict):
@@ -127,12 +140,15 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
             if isinstance(args, str):
                 args = _try_parse_json_dict(args) or {}
             if name in _KNOWN_CPG_TOOLS:
-                tool_calls.append({
-                    "name": name,
-                    "args": args if isinstance(args, dict) else {},
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "tool_call",
-                })
+                call_sig = (name, json.dumps(args, sort_keys=True))
+                if call_sig not in seen_calls:
+                    seen_calls.add(call_sig)
+                    tool_calls.append({
+                        "name": name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "tool_call",
+                    })
 
     # Fallback for natural-language `[Action]: <tool_name> on <target>` lines
     if not tool_calls and "Action]" in cleaned:
@@ -156,17 +172,24 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 
+
 class LocalHuggingFaceChatModel(BaseChatModel):
-    """Wraps a PyTorch/Transformers causal language model (Gemma, Qwen, Llama) with LangChain's ChatModel interface."""
+    """Wraps a PyTorch/Transformers causal or multimodal language model (Gemma, Qwen, Llama) with LangChain's ChatModel interface."""
 
     model: Any
-    tokenizer: Any
+    tokenizer: Optional[Any] = None
+    processor: Optional[Any] = None
     max_new_tokens: int = 384
     temperature: float = 0.1
     top_p: float = 0.9
     bound_tools: List[Dict[str, Any]] = []
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context)
+        if self.tokenizer is None and self.processor is not None:
+            self.tokenizer = self.processor
 
     @property
     def _llm_type(self) -> str:
@@ -194,6 +217,7 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         return self.__class__(
             model=self.model,
             tokenizer=self.tokenizer,
+            processor=self.processor,
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
@@ -242,8 +266,17 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                     "content": str(m.content),
                 })
 
-        template_str = str(getattr(self.tokenizer, "chat_template", "") or "")
-        tok_name = str(getattr(self.tokenizer, "name_or_path", "") or "").lower()
+        tok_obj = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        template_str = str(
+            getattr(self.tokenizer, "chat_template", "")
+            or getattr(tok_obj, "chat_template", "")
+            or ""
+        )
+        tok_name = str(
+            getattr(self.tokenizer, "name_or_path", "")
+            or getattr(tok_obj, "name_or_path", "")
+            or ""
+        ).lower()
         is_gemma = "gemma" in tok_name or "<start_of_turn>" in template_str
 
         # Path 1: Native tool-aware ChatML template (e.g., Qwen2.5)
@@ -332,18 +365,29 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                 tokenize=False,
             )
         except Exception:
-            if is_gemma:
+            try:
+                multimodal_msgs = [
+                    {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+                    for m in alternating_msgs
+                ]
+                return self.tokenizer.apply_chat_template(
+                    multimodal_msgs,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception:
+                if is_gemma:
+                    rendered = []
+                    for m in alternating_msgs:
+                        g_role = "model" if m["role"] == "assistant" else "user"
+                        rendered.append(f"<start_of_turn>{g_role}\n{m['content']}<end_of_turn>")
+                    rendered.append("<start_of_turn>model\n")
+                    return "\n".join(rendered)
                 rendered = []
-                for m in alternating_msgs:
-                    g_role = "model" if m["role"] == "assistant" else "user"
-                    rendered.append(f"<start_of_turn>{g_role}\n{m['content']}<end_of_turn>")
-                rendered.append("<start_of_turn>model\n")
+                for m in raw_msgs:
+                    rendered.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
+                rendered.append("<|im_start|>assistant\n")
                 return "\n".join(rendered)
-            rendered = []
-            for m in raw_msgs:
-                rendered.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
-            rendered.append("<|im_start|>assistant\n")
-            return "\n".join(rendered)
 
     def _extract_tool_calls(self, text: str) -> List[Dict[str, Any]]:
         """Extracts tool calls from assistant output."""
@@ -361,19 +405,35 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         from transformers import StoppingCriteria, StoppingCriteriaList
 
         prompt_text = self._convert_messages_to_prompt(messages)
-        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
-        prompt_len = inputs.input_ids.shape[1]
-        tokenizer_ref = self.tokenizer
+        try:
+            inputs = self.tokenizer(prompt_text, return_tensors="pt")
+        except TypeError:
+            inputs = self.tokenizer(text=prompt_text, return_tensors="pt")
+        inputs = inputs.to(self.model.device)
+
+        if hasattr(inputs, "input_ids"):
+            prompt_len = inputs.input_ids.shape[1]
+        elif isinstance(inputs, dict) and "input_ids" in inputs:
+            prompt_len = inputs["input_ids"].shape[-1]
+        else:
+            prompt_len = len(inputs[0])
+
+        tok_obj = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None) or getattr(tok_obj, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None) or getattr(tok_obj, "eos_token_id", None)
 
         class _ToolCallStoppingCriteria(StoppingCriteria):
-            """Halts generation immediately after `</tool_call>` or before a hallucinated `[Observation]` block."""
+            """Halts generation immediately after `</tool_call>`, closing ```, or before a hallucinated `[Observation]` block."""
 
             def __call__(self, input_ids: Any, scores: Any, **kw: Any) -> bool:
                 gen_ids = input_ids[0][prompt_len:]
                 if len(gen_ids) < 4:
                     return False
-                tail_text = tokenizer_ref.decode(gen_ids[-24:], skip_special_tokens=False)
+                tail_text = tok_obj.decode(gen_ids[-24:], skip_special_tokens=False)
                 if "</tool_call>" in tail_text:
+                    return True
+                if "```" in tail_text and "tool_call" in tail_text and tail_text.rstrip().endswith("```"):
                     return True
                 if "Observation]" in tail_text or "**[Observation" in tail_text:
                     return True
@@ -384,7 +444,7 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             "temperature": self.temperature,
             "top_p": self.top_p,
             "do_sample": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
+            "pad_token_id": pad_id,
             "stopping_criteria": StoppingCriteriaList([_ToolCallStoppingCriteria()]),
         }
         if hasattr(self.model, "generation_config") and getattr(self.model.generation_config, "max_length", None) is not None:
@@ -394,7 +454,8 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             outputs = self.model.generate(**inputs, **gen_kwargs)
 
         new_tokens = outputs[0][prompt_len:]
-        raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
+        raw_text = tok_obj.decode(new_tokens, skip_special_tokens=False)
+
 
         # Free GPU tensors immediately to prevent multi-turn VRAM fragmentation/OOM
         del inputs, outputs, new_tokens
@@ -648,8 +709,9 @@ def create_cpg_langgraph_agent(
         last_msg = state["messages"][-1]
         tool_calls = getattr(last_msg, "tool_calls", []) or []
 
-        visited_nodes = set(state.get("visited_nodes") or set())
-        visited_signatures = set(state.get("visited_signatures") or set())
+        visited_nodes = set(state.get("visited_nodes") or [])
+        raw_sigs = state.get("visited_signatures") or []
+        visited_signatures = set(tuple(s) for s in raw_sigs)
         patch_attempts = int(state.get("patch_attempts") or 0)
         max_retries = int(state.get("max_patch_attempts") or max_patch_attempts)
         failure_tracebacks = list(state.get("failure_tracebacks") or [])
@@ -786,8 +848,8 @@ def create_cpg_langgraph_agent(
 
         return {
             "messages": tool_messages,
-            "visited_nodes": visited_nodes,
-            "visited_signatures": visited_signatures,
+            "visited_nodes": list(visited_nodes),
+            "visited_signatures": [list(s) for s in visited_signatures],
             "status": current_status,
             "patch_attempts": patch_attempts,
             "max_patch_attempts": max_retries,
@@ -873,8 +935,8 @@ def run_langgraph_agent_loop(
 
     initial_state: CPGDebugState = {
         "messages": initial_messages,
-        "visited_nodes": set(),
-        "visited_signatures": set(),
+        "visited_nodes": [],
+        "visited_signatures": [],
         "entry_points": entry_points,
         "final_deduction": None,
         "turn_count": 0,

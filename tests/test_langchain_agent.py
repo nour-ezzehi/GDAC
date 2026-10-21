@@ -395,4 +395,22 @@ class TestLangGraphAgent:
         assert partial_calls[0]["args"]["line_number"] == 84
         assert "1 - discount_percent" in partial_calls[0]["args"]["new_string"]
 
+        # Verify dual tool call output (```tool_call and <tool_call>) is deduplicated and cleaned
+        dual_call_output = (
+            "The bug is in line L84.\n\n"
+            "```tool_call\n"
+            '{"name": "verify_patch", "arguments": {"target": "107374182415", "line_number": 84, "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2) }}\n'
+            "```\n"
+            "<tool_call>\n"
+            '{"name": "verify_patch", "arguments": {"target": "107374182415", "line_number": 84, "new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2) }}\n'
+            "</tool_call>"
+        )
+        dual_calls = parse_tool_calls_from_text(dual_call_output)
+        assert len(dual_calls) == 1
+        assert dual_calls[0]["name"] == "verify_patch"
+        assert dual_calls[0]["args"]["line_number"] == 84
+        assert not dual_calls[0]["args"]["new_string"].endswith("}}")
+        assert not dual_calls[0]["args"]["new_string"].endswith("</")
+
+
 
