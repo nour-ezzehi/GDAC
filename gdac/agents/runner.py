@@ -24,7 +24,7 @@ def run_langgraph_agent_loop(
     max_turns: int = 6,
     max_patch_attempts: int = 3,
     thread_id: str = "got_debug_session",
-    use_multiagent: bool = False,
+    use_multiagent: bool = True,
 ) -> str:
     """Executes the autonomous debugging loop using LangGraph."""
     reset_tool_memory()

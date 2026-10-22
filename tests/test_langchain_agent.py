@@ -96,6 +96,13 @@ class TestLangChainTools:
         assert data["result"] == 80.0
         assert data["expression"] == "100.0 * (1 - 20.0 / 100.0)"
 
+        # Test generic math module functions
+        sqrt_res = json.loads(tools["calculate_expression"].invoke({"expression": "sqrt(144) + ceil(4.2)"}))
+        assert sqrt_res["result"] == 17.0
+
+        pow_res = json.loads(tools["calculate_expression"].invoke({"expression": "pow(2, 8) + abs(-50)"}))
+        assert pow_res["result"] == 306
+
         # Verify unauthorized functions are blocked
         unauth_str = tools["calculate_expression"].invoke({"expression": "__import__('os').system('ls')"})
         unauth_data = json.loads(unauth_str)

@@ -162,7 +162,7 @@ def create_cpg_langgraph_agent(
 
                 elif patch_status in ("FAILED", "ERROR"):
                     patch_attempts += 1
-                    tb_text = str(res_data.get("traceback") or res_data.get("error") or "")
+                    tb_text = str(res_data.get("traceback") or res_data.get("assertion_failure") or res_data.get("error") or "")
                     if tb_text:
                         failure_tracebacks.append(tb_text)
                     new_vars = list(res_data.get("implicated_variables") or [])
@@ -191,15 +191,9 @@ def create_cpg_langgraph_agent(
                                     graph,
                                     method_id=resolved_id,
                                     target_vars=implicated_variables,
-                                    token_budget=200,
+                                    token_budget=150,
                                 )
-                                res_data["forced_condense_method_slice"] = {
-                                    "method_id": reslice_dict["method_id"],
-                                    "target_vars": reslice_dict["target_vars"],
-                                    "slice_lines": reslice_dict["slice_text"].splitlines(),
-                                    "slice_text": reslice_dict["slice_text"],
-                                    "method_summary": reslice_dict["method_summary"],
-                                }
+                                res_data["causal_slice"] = reslice_dict["slice_text"]
                                 tool_output = json.dumps(res_data, indent=2)
                             except Exception:
                                 pass

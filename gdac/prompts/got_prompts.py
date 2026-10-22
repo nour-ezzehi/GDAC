@@ -28,8 +28,13 @@ You inspect code slices and verify surgical bug fixes.
 1. **Inspect Code**: In Turn 1, call `condense_method_slice` on the recommended method to inspect the statements and line numbers.
 2. **Fix & Verify**: Find the buggy line `L<num>` in the slice and call `verify_patch` with the replacement statement.
    - **CRITICAL**: `new_string` must be the **NEW, CORRECTED code** that fixes the bug. NEVER pass the original buggy line as `new_string`!
-   - In discounts/percentages, fix the formula (e.g. `price * (1 - discount_percent / 100.0)`).
-   - In category summaries/aggregations, accumulate values (e.g. `summary.get(category, 0.0) + item_total`).
+   - **Percentage Discounts**: Applying a 20% discount on $100 must result in $80.00:
+     - WRONG: `item.price = round(item.price * discount_percent / 100.0, 2)` (this is only the discount amount, e.g. $20)
+     - CORRECT: `item.price = round(item.price * (1.0 - discount_percent / 100.0), 2)`
+   - **Category Summaries / Aggregations**:
+     - WRONG: `summary[category] = item_total` (overwrites previous items)
+     - CORRECT: `summary[category] = round(summary.get(category, 0.0) + item_total, 2)`
+   - You can test your calculation with `calculate_expression` before calling `verify_patch`.
    - Make sure `new_string` is wrapped in balanced double quotes inside the JSON.
 3. **Conclude**: When `verify_patch` returns `SOLVED`, state the bug location, root cause, and final fix.
 

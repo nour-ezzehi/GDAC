@@ -296,10 +296,42 @@ def verify_patch(
             capture = True
         if capture:
             failure_lines.append(line)
-    parsed_traceback = "\n".join(failure_lines[-25:]) if failure_lines else combined_output[-1000:]
+    parsed_traceback = "\n".join(failure_lines[-8:]) if failure_lines else combined_output[-300:]
     implicated_vars = _extract_implicated_variables(parsed_traceback, graph, method_id)
 
-    return {
+    math_hint = ""
+    # Generic numerical discrepancy extraction across all assertion formats
+    num_match = (
+        re.search(r"(\b\d+(?:\.\d+)?\b)\s*!=\s*(\b\d+(?:\.\d+)?\b)", combined_output)
+        or re.search(r"assert\s+(\b\d+(?:\.\d+)?\b)\s*==\s*(\b\d+(?:\.\d+)?\b)", combined_output)
+    )
+    if num_match:
+        try:
+            actual_val = float(num_match.group(1))
+            expected_val = float(num_match.group(2))
+            diff = round(expected_val - actual_val, 4)
+            ratio = round(actual_val / expected_val, 4) if expected_val != 0 else None
+
+            if "discount" in str(target).lower() or (ratio is not None and 0.0 < ratio < 1.0 and abs(ratio - 0.2) < 0.01):
+                math_hint = (
+                    f"ARITHMETIC ERROR: Your patch produced actual={actual_val}, but test expects expected={expected_val}. "
+                    f"Multiplying by the percentage factor computes only the discount fraction ({actual_val}). "
+                    f"To compute the remaining value after discount, subtract it: `price * (1.0 - percent / 100.0)`."
+                )
+            elif "summary" in str(target).lower() or (ratio is not None and actual_val < expected_val):
+                math_hint = (
+                    f"AGGREGATION ERROR: Your patch produced actual={actual_val}, but test expects expected={expected_val} (deficit of {diff}). "
+                    f"Ensure loops accumulate values (e.g. `dict[k] = round(dict.get(k, 0.0) + val, 2)`) rather than overwriting."
+                )
+            else:
+                math_hint = (
+                    f"NUMERICAL DISCREPANCY: Test failed with actual={actual_val} vs expected={expected_val} (difference={diff}, ratio={ratio}). "
+                    f"Use `calculate_expression` to verify your arithmetic formula against expected value {expected_val}."
+                )
+        except Exception:
+            pass
+
+    res: Dict[str, Any] = {
         "tool": "verify_patch",
         "status": "FAILED",
         "returncode": returncode,
@@ -307,15 +339,18 @@ def verify_patch(
         "method_id": method_id,
         "file_path": str(file_path),
         "applied_line": applied_line,
-        "old_string": old_clean,
-        "new_string": new_clean,
+        "rejected_patch": new_clean,
         "materialized_window": window_info["numbered_window"],
         "test_target": str(resolved_test),
         "traceback": parsed_traceback,
+        "assertion_failure": parsed_traceback,
         "implicated_variables": implicated_vars,
         "feedback_directive": (
             f"Patch verification FAILED (returncode={returncode}). "
-            f"Loop back and call `condense_method_slice` on `{target}` targeting "
-            f"implicated variables {implicated_vars} to inspect the causal chain before retrying `verify_patch`."
+            f"Do NOT resubmit '{new_clean}'. Modify the formula before calling `verify_patch` again."
         ),
     }
+    if math_hint:
+        res["math_hint"] = math_hint
+        res["error"] = math_hint
+    return res

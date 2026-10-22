@@ -12,6 +12,13 @@ def calculate_expression(expression: str) -> Dict[str, Any]:
     Prevents execution of arbitrary code or unauthorized identifiers via AST symbol validation.
     """
     clean_expr = expression.strip().strip("`").strip()
+    import math
+
+    safe_math_attrs = {
+        k: getattr(math, k)
+        for k in dir(math)
+        if not k.startswith("_")
+    }
     safe_env = {
         "__builtins__": None,
         "round": round,
@@ -23,6 +30,8 @@ def calculate_expression(expression: str) -> Dict[str, Any]:
         "float": float,
         "int": int,
         "len": len,
+        "math": math,
+        **safe_math_attrs,
     }
     try:
         code_obj = compile(clean_expr, "<calc>", "eval")
@@ -31,7 +40,7 @@ def calculate_expression(expression: str) -> Dict[str, Any]:
                 return {
                     "tool": "calculate_expression",
                     "expression": clean_expr,
-                    "error": f"Unauthorized identifier '{name}'. Permitted functions: round, abs, min, max, sum, pow, float, int.",
+                    "error": f"Unauthorized identifier '{name}'. Permitted: arithmetic operators (+, -, *, /, //, %, **), builtins (round, abs, min, max, sum, pow, float, int, len), and standard math library functions (sqrt, ceil, floor, log, exp, sin, cos, pi, etc.).",
                 }
         result = eval(code_obj, safe_env)
         return {

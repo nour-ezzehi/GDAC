@@ -92,6 +92,24 @@ def create_cpg_multiagent_system(
                 if args.get("target"):
                     buggy_target = str(args["target"])
 
+        if not proposed_new:
+            import re
+            content = str(response.content or "")
+            code_blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", content, re.DOTALL)
+            if code_blocks:
+                cand_lines = [l.strip() for l in code_blocks[-1].splitlines() if l.strip() and not l.strip().startswith("#")]
+                if cand_lines:
+                    proposed_new = cand_lines[-1]
+            if not proposed_new:
+                # Generic extraction: assignments (<var> = <expr>) or return statements
+                stmt_match = re.search(r"^\s*([a-zA-Z_][a-zA-Z0-9_\.\[\]'\"]+\s*=\s*.+)$", content, re.MULTILINE)
+                if stmt_match:
+                    proposed_new = stmt_match.group(1).strip()
+                else:
+                    ret_match = re.search(r"^\s*(return\s+.+)$", content, re.MULTILINE)
+                    if ret_match:
+                        proposed_new = ret_match.group(1).strip()
+
         return {
             "messages": [response],
             "turn_count": new_turn,
@@ -131,23 +149,38 @@ def create_cpg_multiagent_system(
         returncode = parsed.get("returncode")
 
         if status == "SOLVED" and returncode == 0:
+            last_text = ""
+            for m in reversed(state.get("messages") or []):
+                if hasattr(m, "content") and m.content:
+                    last_text = m.content
+                    break
             final_ded = (
+                f"{last_text}\n\n"
                 f"### [Multi-Agent BLSP Verification: SOLVED]\n"
                 f"- **Status**: `SOLVED` (`pytest` returncode = 0)\n"
                 f"- **Target**: `{target}` Line {line_number}\n"
                 f"- **Surgical Fix**: `{new_string}`"
-            )
+            ).strip()
             return {
                 "status": "SOLVED",
                 "patch_attempts": patch_attempts,
                 "final_deduction": final_ded,
             }
         else:
-            tb = parsed.get("error") or parsed.get("traceback") or "Test failed"
+            from langchain_core.messages import HumanMessage
+            tb = parsed.get("math_hint") or parsed.get("error") or parsed.get("assertion_failure") or "Test failed"
             failure_tbs = list(state.get("failure_tracebacks") or [])
             failure_tbs.append(str(tb))
+            fail_feedback = HumanMessage(
+                content=(
+                    f"### [Verifier Feedback]: The proposed patch `{new_string}` failed runtime testing:\n"
+                    f"{tb}\n"
+                    f"Please correct the calculation formula for line {line_number}."
+                )
+            )
             return {
                 "status": "FAILED_MAX_RETRIES" if patch_attempts >= max_patch_attempts else "RETRY",
+                "messages": [fail_feedback],
                 "patch_attempts": patch_attempts,
                 "failure_tracebacks": failure_tbs,
                 "implicated_variables": list(parsed.get("implicated_variables") or []),
