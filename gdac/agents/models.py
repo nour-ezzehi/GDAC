@@ -267,17 +267,21 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                     )
                 elif t_name == "verify_patch" and parsed_tool.get("status") != "SOLVED":
                     mat_win = parsed_tool.get("materialized_window") or ""
-                    err_reason = parsed_tool.get("error") or "test assertion failed"
+                    tb_snippet = parsed_tool.get("traceback") or ""
+                    err_reason = parsed_tool.get("error") or (f"test assertion failed:\n{tb_snippet}" if tb_snippet else "test assertion failed")
                     if mat_win:
                         extra_code_block = (
                             f"### Materialized Source Window (`{parsed_tool.get('file_path', '')}`):\n"
                             f"```text\n{mat_win}\n```\n\n"
                         )
                     follow_up = (
-                        f"The previous `verify_patch` failed ({err_reason}). "
-                        f"Inspect the numbered lines above, write 1-2 sentences of **[Synthesis & Deduction]**, "
-                        f"and emit a corrected `<tool_call>...</tool_call>` for `verify_patch` with the exact buggy "
-                        f"`line_number`, `old_string`, and a DIFFERENT `new_string`."
+                        f"The previous `verify_patch` failed ({err_reason}).\n\n"
+                        f"CRITICAL INSTRUCTIONS:\n"
+                        f"1. NEVER submit the same line or formula that failed! You must submit a DIFFERENT `new_string`.\n"
+                        f"2. For discounts: multiplying `price * discount / 100` computes only the discount amount. "
+                        f"The final discounted price is `price * (1.0 - discount / 100.0)`.\n"
+                        f"3. You can test your calculation first with `calculate_expression` before calling `verify_patch`.\n"
+                        f"Write 1-2 sentences of **[Synthesis & Deduction]**, then emit `<tool_call>...</tool_call>` with the corrected `new_string`."
                     )
 
                 user_chunk = (

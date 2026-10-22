@@ -417,6 +417,18 @@ def main() -> None:
         choices=["discount", "summary"],
         help="Bug scenario to test in dry-run mode (discount or summary)",
     )
+    parser.add_argument(
+        "--multiagent",
+        action="store_true",
+        default=True,
+        help="Use 3-agent collaborative pipeline (Locator -> Solver -> Verifier) instead of single agent loop.",
+    )
+    parser.add_argument(
+        "--single-agent",
+        dest="multiagent",
+        action="store_false",
+        help="Use single agent loop instead of 3-agent pipeline.",
+    )
 
     args = parser.parse_args()
 
@@ -452,7 +464,7 @@ def main() -> None:
                 )
             )
             mock_llm = MockGoTChatModel(problem_type=args.target)
-            run_langgraph_agent_loop(mock_llm, graph, failing_test, max_turns=4)
+            run_langgraph_agent_loop(mock_llm, graph, failing_test, max_turns=4, use_multiagent=args.multiagent)
         else:
             run_mock_agent(graph, problem_type=args.target)
         return
@@ -477,7 +489,7 @@ def main() -> None:
             print("[-] LangChain is not installed. Install via: pip install langchain langgraph pydantic", file=sys.stderr)
             sys.exit(1)
         langchain_chat = LocalHuggingFaceChatModel(model=model, tokenizer=tokenizer)
-        run_langgraph_agent_loop(langchain_chat, graph, sample_problem)
+        run_langgraph_agent_loop(langchain_chat, graph, sample_problem, use_multiagent=args.multiagent)
     else:
         run_agent_loop(model, tokenizer, graph, sample_problem)
 

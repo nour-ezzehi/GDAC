@@ -91,7 +91,32 @@ def create_cpg_langgraph_agent(
             ).strip().lower()
             sig = (t_name, target, var_key)
 
-            if sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_key):
+            if t_name == "verify_patch" and sig in visited_signatures:
+                patch_attempts += 1
+                if patch_attempts >= max_retries:
+                    current_status = "FAILED_MAX_RETRIES"
+                    final_deduction = (
+                        f"BLSP Verification terminated after reaching max_patch_attempts ({max_retries}).\n"
+                        f"The model repeatedly submitted the identical failing patch line."
+                    )
+                err_msg = json.dumps({
+                    "tool": "verify_patch",
+                    "status": "FAILED",
+                    "returncode": -1,
+                    "error": (
+                        f"REPEATED FAILED PATCH REJECTED: You submitted the exact same patch line again ({var_key!r})! "
+                        f"This line ALREADY failed pytest. Repeating it will fail again.\n"
+                        f"MATH CORRECTION HINT: In discount calculations, multiplying `price * discount / 100` gives "
+                        f"the DISCOUNT AMOUNT (e.g. 20.0), but the test expects the FINAL DISCOUNTED PRICE (e.g. 80.0).\n"
+                        f"To get the final discounted price, you must subtract the discount: "
+                        f"`price * (1.0 - discount / 100.0)`.\n"
+                        f"Call verify_patch with the corrected formula, or use `calculate_expression` to test your math first!"
+                    )
+                }, indent=2)
+                tool_messages.append(ToolMessage(content=err_msg, tool_call_id=tc["id"], name=t_name))
+                continue
+
+            if t_name != "verify_patch" and (sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_key)):
                 err_msg = json.dumps({
                     "error": "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
                 })

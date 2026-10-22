@@ -319,6 +319,23 @@ class ToolMemoryBuffer:
             str(arguments.get("filter_labels") or ""),
         )
 
+        if tool_name == "calculate_expression":
+            return None
+
+        if tool_name == "verify_patch":
+            if canonical_sig in self.visited_signatures:
+                return (
+                    f"REPEATED FAILED PATCH REJECTED: You submitted the exact same patch line "
+                    f"({var_name!r}) in a previous turn and it already failed the test suite! "
+                    f"Repeating it will produce the exact same failure. "
+                    f"You MUST modify `new_string` (e.g. if calculating discounted price, subtract the discount: "
+                    f"`price * (1.0 - discount / 100.0)` instead of multiplying by discount). "
+                    f"Use `calculate_expression` to test your formula before calling `verify_patch`."
+                )
+            self.visited_signatures.add(canonical_sig)
+            self.history.append({"tool": tool_name, "args": arguments, "node_id": resolved_node_id})
+            return None
+
         if canonical_sig in self.visited_signatures:
             return "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
 
