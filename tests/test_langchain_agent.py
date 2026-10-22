@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import networkx as nx
 
-from agent_langchain_tools import (
+from gdac.tools import (
     TraverseASTInput,
     TraverseCFGInput,
     TraverseDataFlowInput,
@@ -14,17 +14,18 @@ from agent_langchain_tools import (
     CondenseMethodSliceInput,
     VerifyPatchInput,
     SemanticSearchInput,
+    CalculateExpressionInput,
     create_cpg_langchain_tools,
+    reset_tool_memory,
 )
-from agent_langchain import (
+from gdac.agents import (
     CPGDebugState,
     MockGoTChatModel,
     create_cpg_langgraph_agent,
+    create_cpg_multiagent_system,
     run_langgraph_agent_loop,
 )
-from agent_tools import reset_tool_memory
-from cpg_bridge import load_cpg_json
-from cpg_condenser import condense_cpg
+from gdac.services import load_cpg_json, condense_cpg
 
 
 @pytest.fixture(autouse=True)
@@ -70,10 +71,13 @@ class TestLangChainTools:
         search_in = SemanticSearchInput(query="discount error")
         assert search_in.top_k == 3
 
+        calc_in = CalculateExpressionInput(expression="100.0 * (1 - 20.0 / 100.0)")
+        assert calc_in.expression == "100.0 * (1 - 20.0 / 100.0)"
+
     def test_tools_creation(self, sample_graph):
-        """Verifies that all 7 structured tools are properly instantiated."""
+        """Verifies that all 8 structured tools are properly instantiated."""
         tools = create_cpg_langchain_tools(sample_graph)
-        assert len(tools) == 7
+        assert len(tools) == 8
         tool_names = {t.name for t in tools}
         assert "traverse_ast" in tool_names
         assert "traverse_cfg" in tool_names
@@ -82,6 +86,21 @@ class TestLangChainTools:
         assert "condense_method_slice" in tool_names
         assert "verify_patch" in tool_names
         assert "semantic_code_search" in tool_names
+        assert "calculate_expression" in tool_names
+
+    def test_calculate_expression_tool(self, sample_graph):
+        """Executes calculate_expression tool with safe arithmetic and syntax error handling."""
+        tools = {t.name: t for t in create_cpg_langchain_tools(sample_graph)}
+        res_str = tools["calculate_expression"].invoke({"expression": "100.0 * (1 - 20.0 / 100.0)"})
+        data = json.loads(res_str)
+        assert data["result"] == 80.0
+        assert data["expression"] == "100.0 * (1 - 20.0 / 100.0)"
+
+        # Verify unauthorized functions are blocked
+        unauth_str = tools["calculate_expression"].invoke({"expression": "__import__('os').system('ls')"})
+        unauth_data = json.loads(unauth_str)
+        assert "error" in unauth_data
+
 
     def test_traverse_ast_tool(self, sample_graph):
         """Executes traverse_ast tool with Pydantic validation."""
@@ -288,7 +307,7 @@ class TestLangGraphAgent:
 
     def test_gemma_hallucinated_observation_stripping_and_action_parsing(self):
         """Verifies that Gemma outputs with natural-language [Action] and hallucinated [Observation] are cleaned and parsed."""
-        from agent_langchain import parse_tool_calls_from_text, strip_hallucinated_observation
+        from gdac.agents import parse_tool_calls_from_text, strip_hallucinated_observation
 
         raw_gemma_output = (
             "Okay, let's begin.\n\n"
@@ -311,8 +330,8 @@ class TestLangGraphAgent:
 
     def test_scenario2_entry_point_excludes_tests_and_condense_default_vars(self, sample_graph):
         """Verifies that pytest tracebacks rank production methods #1 (excluding tests) and condense_method_slice works without target_vars."""
-        from agent_tools import reset_tool_memory
-        from cpg_rag import find_semantic_entry_points
+        from gdac.tools import reset_tool_memory
+        from gdac.services import find_semantic_entry_points
         reset_tool_memory()
 
         scenario2_query = (
@@ -341,7 +360,7 @@ class TestLangGraphAgent:
         assert "summary = {} = {}" not in parsed["slice_text"]
 
         # Verify malformed ```tool_call> with missing closing `}` is parsed cleanly
-        from agent_langchain import parse_tool_calls_from_text
+        from gdac.agents import parse_tool_calls_from_text
         malformed_turn3 = (
             "```tool_call>\n"
             '{"name": "condense_method_slice", "arguments": {"target": "InventoryReporter.generate_category_summary", "target_vars": ["summary", "item", "item_total", "summary[item.category]"]}\n'
@@ -411,6 +430,36 @@ class TestLangGraphAgent:
         assert dual_calls[0]["args"]["line_number"] == 84
         assert not dual_calls[0]["args"]["new_string"].endswith("}}")
         assert not dual_calls[0]["args"]["new_string"].endswith("</")
+
+    def test_multiagent_system_simulation(self, sample_graph):
+        """Verifies multi-agent system (Locator -> Solver -> Verifier) collaboration."""
+        mock_llm = MockGoTChatModel(problem_type="discount")
+        tools = create_cpg_langchain_tools(sample_graph)
+        multiagent_app = create_cpg_multiagent_system(
+            mock_llm, tools, sample_graph, max_turns=6, max_patch_attempts=3
+        )
+        final_state = multiagent_app.invoke(
+            {
+                "messages": [],
+                "visited_nodes": [],
+                "visited_signatures": [],
+                "entry_points": [],
+                "final_deduction": None,
+                "turn_count": 0,
+                "status": "IN_PROGRESS",
+                "patch_attempts": 0,
+                "max_patch_attempts": 3,
+                "failure_tracebacks": [],
+                "implicated_variables": [],
+                "buggy_target": "InventoryManager.apply_discount",
+                "buggy_line": 84,
+                "proposed_new_string": "item.price = round(item.price * (1 - discount_percent / 100.0), 2)",
+            },
+            config={"configurable": {"thread_id": "test_multiagent_session"}},
+        )
+        assert final_state["status"] == "SOLVED"
+        assert "SOLVED" in (final_state["final_deduction"] or "")
+
 
 
 

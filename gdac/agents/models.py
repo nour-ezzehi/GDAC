@@ -1,24 +1,13 @@
-#!/usr/bin/env python3
-"""LangGraph Stateful Agent Architecture for Code Property Graph (CPG) Debugging.
-
-Implements a production-grade cyclical agent using LangGraph and LangChain:
-  1. CPGDebugState: Typed state tracking messages, visited CPG nodes, and tool signatures.
-  2. Anti-Looping Interception: Built directly into the StateGraph ToolNode.
-  3. Model-Agnostic: Works seamlessly with local quantized HuggingFace models in Colab,
-     as well as cloud providers (OpenAI, Gemini, Anthropic, Ollama).
-  4. MemorySaver: Persistent checkpointer for turn-by-turn state history.
-"""
+"""ChatModel Adapters and Model Utilities for GDAC Agents."""
 
 from __future__ import annotations
 
+import gc
 import json
 import re
+import sys
 import uuid
-from typing import Annotated, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
-from typing_extensions import TypedDict
-
-import networkx as nx
-from pydantic import BaseModel, ConfigDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -31,53 +20,19 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, StateGraph
-from langgraph.graph.message import add_messages
-
-from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
-from agent_langchain_tools import create_cpg_langchain_tools
-from agent_tools import GLOBAL_TOOL_MEMORY, reset_tool_memory, resolve_target_node
-from cpg_condenser import condense_method_slice
-from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
-
-
-# ==============================================================================
-# 1. LangGraph State Definition
-# ==============================================================================
-
-class CPGDebugState(TypedDict, total=False):
-    """The central state of the Graph-of-Thoughts debugging agent."""
-    messages: Annotated[List[BaseMessage], add_messages]
-    visited_nodes: Sequence[int]
-    visited_signatures: Sequence[Tuple[str, str, str]]
-    entry_points: List[Dict[str, Any]]
-    final_deduction: Optional[str]
-    turn_count: int
-    status: Optional[str]
-    patch_attempts: int
-    max_patch_attempts: int
-    failure_tracebacks: List[str]
-    implicated_variables: List[str]
-
-
-
-# ==============================================================================
-# 2. Local Quantized HuggingFace ChatModel Adapter (Colab / T4 GPU)
-# ==============================================================================
+from langchain_core.utils.json import parse_json_markdown, parse_partial_json
+from pydantic import ConfigDict
 
 _KNOWN_CPG_TOOLS = (
     "condense_method_slice",
     "verify_patch",
+    "calculate_expression",
     "trace_variable_to_sink",
     "traverse_ast",
     "traverse_cfg",
     "traverse_data_flow",
     "semantic_code_search",
 )
-
-
-from langchain_core.utils.json import parse_json_markdown, parse_partial_json
 
 
 def strip_hallucinated_observation(text: str) -> str:
@@ -172,9 +127,8 @@ def parse_tool_calls_from_text(text: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 
-
 class LocalHuggingFaceChatModel(BaseChatModel):
-    """Wraps a PyTorch/Transformers causal or multimodal language model (Gemma, Qwen, Llama) with LangChain's ChatModel interface."""
+    """Wraps a PyTorch/Transformers causal or multimodal language model with LangChain's ChatModel interface."""
 
     model: Any
     tokenizer: Optional[Any] = None
@@ -200,7 +154,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         tools: Sequence[Union[Dict[str, Any], type, Callable, BaseTool]],
         **kwargs: Any,
     ) -> BaseChatModel:
-        """Binds tool schemas to the model."""
         formatted_tools = []
         for t in tools:
             if isinstance(t, BaseTool):
@@ -225,7 +178,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         )
 
     def _format_tools_prompt_block(self) -> str:
-        """Creates a compact tool schema block for models whose tokenizer template does not inject `tools` (e.g., Gemma)."""
         if not self.bound_tools:
             return ""
         lines = [
@@ -241,7 +193,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         return "\n".join(lines)
 
     def _convert_messages_to_prompt(self, messages: List[BaseMessage]) -> str:
-        """Converts LangChain messages into a prompt compatible with both Gemma (strict user/model alternation) and ChatML."""
         raw_msgs: List[Dict[str, str]] = []
         for m in messages:
             if isinstance(m, SystemMessage):
@@ -279,7 +230,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         ).lower()
         is_gemma = "gemma" in tok_name or "<start_of_turn>" in template_str
 
-        # Path 1: Native tool-aware ChatML template (e.g., Qwen2.5)
         if not is_gemma and "tools" in template_str and "system" in template_str:
             try:
                 return self.tokenizer.apply_chat_template(
@@ -291,7 +241,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             except Exception:
                 pass
 
-        # Path 2: Gemma / Generic strict alternating user/assistant turns with explicit tool-schema injection
         tools_block = self._format_tools_prompt_block()
         system_parts: List[str] = []
         alternating_msgs: List[Dict[str, str]] = []
@@ -390,7 +339,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
                 return "\n".join(rendered)
 
     def _extract_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extracts tool calls from assistant output."""
         return parse_tool_calls_from_text(text)
 
     def _generate(
@@ -424,8 +372,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
             pad_id = getattr(self.tokenizer, "eos_token_id", None) or getattr(tok_obj, "eos_token_id", None)
 
         class _ToolCallStoppingCriteria(StoppingCriteria):
-            """Halts generation immediately after `</tool_call>`, closing ```, or before a hallucinated `[Observation]` block."""
-
             def __call__(self, input_ids: Any, scores: Any, **kw: Any) -> bool:
                 gen_ids = input_ids[0][prompt_len:]
                 if len(gen_ids) < 4:
@@ -456,8 +402,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         new_tokens = outputs[0][prompt_len:]
         raw_text = tok_obj.decode(new_tokens, skip_special_tokens=False)
 
-
-        # Free GPU tensors immediately to prevent multi-turn VRAM fragmentation/OOM
         del inputs, outputs, new_tokens
         gc.collect()
         if torch.cuda.is_available():
@@ -477,10 +421,6 @@ class LocalHuggingFaceChatModel(BaseChatModel):
         generation = ChatGeneration(message=message)
         return ChatResult(generations=[generation])
 
-
-# ==============================================================================
-# 3. Mock Model for Local Dry-Run Simulations
-# ==============================================================================
 
 class MockGoTChatModel(BaseChatModel):
     """Simulates multi-turn GoT reasoning steps including BLSP verify_patch execution."""
@@ -558,7 +498,6 @@ class MockGoTChatModel(BaseChatModel):
                 tool_calls = []
 
         elif self.problem_type == "discount_retry":
-            # Simulates a failed patch attempt -> forced re-slice on implicated vars -> successful patch
             if self.call_index == 1:
                 content = (
                     "### [Hypothesis]\n"
@@ -612,7 +551,6 @@ class MockGoTChatModel(BaseChatModel):
                 }]
 
         else:
-            # Summary bug scenario
             if self.call_index == 1:
                 content = (
                     "### [Hypothesis]\n"
@@ -668,323 +606,60 @@ class MockGoTChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content, tool_calls=tool_calls))])
 
 
-# ==============================================================================
-# 4. LangGraph Agent Construction
-# ==============================================================================
+def load_quantized_model(
+    model_name: str = "google/gemma-2-2b-it",
+    quantization: str = "4bit",
+    device_map: str = "auto",
+) -> Tuple[Any, Any]:
+    """Loads a lightweight coding/instruction model with 4-bit or 8-bit quantization."""
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    except ImportError as exc:
+        raise ImportError(f"Missing required ML packages: {exc}")
 
-def create_cpg_langgraph_agent(
-    model: BaseChatModel,
-    tools: List[BaseTool],
-    graph: nx.MultiDiGraph,
-    max_turns: int = 6,
-    max_patch_attempts: int = 3,
-    checkpointer: Optional[Any] = None,
-) -> Any:
-    """Builds a compiled LangGraph StateGraph agent with anti-looping guards and BLSP feedback routing."""
-    tools_by_name = {t.name: t for t in tools}
-    model_with_tools = model.bind_tools(tools)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    def agent_node(state: CPGDebugState) -> Dict[str, Any]:
-        """Calls the model with current messages and increments turn counter."""
-        msgs = state.get("messages") or []
-        if msgs and isinstance(msgs[-1], AIMessage) and getattr(msgs[-1], "tool_calls", None):
-            return {"turn_count": state.get("turn_count", 0)}
+    compute_dtype = torch.float16
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability(0)
+        if major >= 8 and torch.cuda.is_bf16_supported():
+            compute_dtype = torch.bfloat16
 
-        response = model_with_tools.invoke(msgs)
-        new_turn = state.get("turn_count", 0) + 1
+    bnb_config = None
+    if quantization == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+    elif quantization == "8bit":
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-        final_ded = state.get("final_deduction")
-        # If model produced no tool calls, it has finished reasoning
-        if not getattr(response, "tool_calls", None):
-            final_ded = response.content
+    candidate_names = [model_name]
+    if model_name.startswith("google/gemma"):
+        candidate_names.append(model_name.replace("google/", "unsloth/", 1))
 
-        return {
-            "messages": [response],
-            "turn_count": new_turn,
-            "final_deduction": final_ded,
-        }
+    last_err: Optional[Exception] = None
+    for cand_name in candidate_names:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(cand_name, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-    def tool_node(state: CPGDebugState) -> Dict[str, Any]:
-        """Executes tool calls with state-level anti-looping interceptors and BLSP feedback routing."""
-        last_msg = state["messages"][-1]
-        tool_calls = getattr(last_msg, "tool_calls", []) or []
-
-        visited_nodes = set(state.get("visited_nodes") or [])
-        raw_sigs = state.get("visited_signatures") or []
-        visited_signatures = set(tuple(s) for s in raw_sigs)
-        patch_attempts = int(state.get("patch_attempts") or 0)
-        max_retries = int(state.get("max_patch_attempts") or max_patch_attempts)
-        failure_tracebacks = list(state.get("failure_tracebacks") or [])
-        implicated_variables = list(state.get("implicated_variables") or [])
-        current_status = state.get("status") or "IN_PROGRESS"
-        final_deduction = state.get("final_deduction")
-        tool_messages = []
-
-        for tc in tool_calls:
-            t_name = tc["name"]
-            t_args = dict(tc.get("args") or {})
-            target_raw = (
-                t_args.get("target")
-                or t_args.get("method_name")
-                or t_args.get("method_id")
+            model = AutoModelForCausalLM.from_pretrained(
+                cand_name,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                torch_dtype=compute_dtype,
+                trust_remote_code=True,
             )
-            if target_raw is not None and not t_args.get("target"):
-                t_args["target"] = str(target_raw)
+            return model, tokenizer
+        except Exception as err:
+            last_err = err
+            continue
 
-            # Resolve target node in CPG
-            resolved_id = resolve_target_node(graph, target_raw)
-
-            # If condense_method_slice is invoked without target_vars, default to the method's writes + reads
-            if t_name == "condense_method_slice" and not (t_args.get("target_vars") or t_args.get("var_name")):
-                if resolved_id is not None and resolved_id in graph:
-                    df_sum = graph.nodes[resolved_id].get("data_flow_summary") or {}
-                    auto_vars = list(df_sum.get("writes") or []) + list(df_sum.get("reads") or [])[:2]
-                    t_args["target_vars"] = [v for v in auto_vars if v not in ("self", "this")]
-
-            target = str(t_args.get("target") or "").strip().lower()
-            var_key = str(
-                t_args.get("var_name")
-                or t_args.get("target_vars")
-                or t_args.get("new_string")
-                or ""
-            ).strip().lower()
-            sig = (t_name, target, var_key)
-
-            # Anti-Looping Interception
-            if sig in visited_signatures or (resolved_id and resolved_id in visited_nodes and not var_key):
-                err_msg = json.dumps({
-                    "error": "System Error: You have already inspected this node. Review your previous thoughts and explore a different execution path."
-                })
-                tool_messages.append(ToolMessage(content=err_msg, tool_call_id=tc["id"], name=t_name))
-                continue
-
-            # Execute tool
-            if t_name in tools_by_name:
-                try:
-                    tool_output = tools_by_name[t_name].invoke(t_args)
-                    if not isinstance(tool_output, str):
-                        tool_output = json.dumps(tool_output, indent=2)
-                except Exception as exc:
-                    tool_output = json.dumps({"error": f"Tool execution failed: {str(exc)}"})
-            else:
-                tool_output = json.dumps({"error": f"Tool '{t_name}' not found."})
-
-            # Only record visit in state if tool succeeded without error
-            try:
-                parsed_out = json.loads(tool_output)
-            except json.JSONDecodeError:
-                parsed_out = {}
-
-            if "error" not in parsed_out:
-                visited_signatures.add(sig)
-                if resolved_id and t_name != "verify_patch":
-                    visited_nodes.add(resolved_id)
-
-            # BLSP Feedback Routing for `verify_patch`
-            if t_name == "verify_patch":
-                res_data = parsed_out
-                patch_status = res_data.get("status")
-                returncode = res_data.get("returncode")
-
-                if patch_status == "SOLVED" and returncode == 0:
-                    patch_attempts += 1
-                    current_status = "SOLVED"
-                    base_content = getattr(last_msg, "content", "") or ""
-                    verification_summary = (
-                        f"\n\n### [BLSP Runtime Verification: SOLVED]\n"
-                        f"- **Status**: `SOLVED` (`pytest` returncode = 0)\n"
-                        f"- **Target**: `{res_data.get('target')}` (`{res_data.get('file_path')}` L{res_data.get('applied_line')})\n"
-                        f"- **Surgical Diff**: `{res_data.get('old_string')}` -> `{res_data.get('new_string')}`"
-                    )
-                    final_deduction = (base_content + verification_summary).strip()
-
-                elif patch_status in ("FAILED", "ERROR"):
-                    patch_attempts += 1
-                    tb_text = str(res_data.get("traceback") or res_data.get("error") or "")
-                    if tb_text:
-                        failure_tracebacks.append(tb_text)
-                    new_vars = list(res_data.get("implicated_variables") or [])
-                    if new_vars:
-                        implicated_variables = new_vars
-
-                    # Clear prior condense_method_slice signatures and node memory so re-slicing is allowed
-                    visited_signatures = {
-                        s for s in visited_signatures
-                        if not (s[0] == "condense_method_slice" and s[1] == target)
-                    }
-                    if resolved_id is not None:
-                        visited_nodes.discard(resolved_id)
-                    GLOBAL_TOOL_MEMORY.allow_reslice(resolved_id, target)
-
-                    if patch_attempts >= max_retries:
-                        current_status = "FAILED_MAX_RETRIES"
-                        final_deduction = (
-                            f"BLSP Verification terminated after reaching max_patch_attempts ({max_retries}).\n"
-                            f"Last AssertionError / Traceback:\n{tb_text}"
-                        )
-                    else:
-                        current_status = "RETRY"
-                        # Force an immediate condense_method_slice directly on the graph without polluting ToolMemoryBuffer
-                        if resolved_id is not None and implicated_variables:
-                            try:
-                                reslice_dict = condense_method_slice(
-                                    graph,
-                                    method_id=resolved_id,
-                                    target_vars=implicated_variables,
-                                    token_budget=200,
-                                )
-                                res_data["forced_condense_method_slice"] = {
-                                    "method_id": reslice_dict["method_id"],
-                                    "target_vars": reslice_dict["target_vars"],
-                                    "slice_lines": reslice_dict["slice_text"].splitlines(),
-                                    "slice_text": reslice_dict["slice_text"],
-                                    "method_summary": reslice_dict["method_summary"],
-                                }
-                                tool_output = json.dumps(res_data, indent=2)
-                            except Exception:
-                                pass
-
-            tool_messages.append(ToolMessage(content=tool_output, tool_call_id=tc["id"], name=t_name))
-
-        return {
-            "messages": tool_messages,
-            "visited_nodes": list(visited_nodes),
-            "visited_signatures": [list(s) for s in visited_signatures],
-            "status": current_status,
-            "patch_attempts": patch_attempts,
-            "max_patch_attempts": max_retries,
-            "failure_tracebacks": failure_tracebacks,
-            "implicated_variables": implicated_variables,
-            "final_deduction": final_deduction,
-        }
-
-    def should_continue(state: CPGDebugState) -> str:
-        """Determines whether to execute tools or end the loop after agent_node."""
-        if state.get("status") in ("SOLVED", "FAILED_MAX_RETRIES"):
-            return END
-        if state.get("final_deduction") is not None and not getattr(state["messages"][-1], "tool_calls", None):
-            return END
-        if state.get("turn_count", 0) >= max_turns:
-            return END
-        last_msg = state["messages"][-1]
-        if getattr(last_msg, "tool_calls", None):
-            return "tools"
-        return END
-
-    def should_continue_after_tools(state: CPGDebugState) -> str:
-        """Routes after tool_node: terminates on SOLVED or FAILED_MAX_RETRIES, otherwise loops back to agent."""
-        if state.get("status") in ("SOLVED", "FAILED_MAX_RETRIES"):
-            return END
-        if state.get("turn_count", 0) >= max_turns:
-            return END
-        return "agent"
-
-    # Build Graph
-    workflow = StateGraph(CPGDebugState)
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", tool_node)
-
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    workflow.add_conditional_edges("tools", should_continue_after_tools, {"agent": "agent", END: END})
-
-    memory = checkpointer if checkpointer is not None else MemorySaver()
-    return workflow.compile(checkpointer=memory)
-
-
-# ==============================================================================
-# 5. High-Level LangGraph Execution Loop
-# ==============================================================================
-
-def run_langgraph_agent_loop(
-    model: BaseChatModel,
-    graph: nx.MultiDiGraph,
-    problem_prompt: str,
-    max_turns: int = 6,
-    max_patch_attempts: int = 3,
-    thread_id: str = "got_debug_session",
-) -> str:
-    """Executes the autonomous debugging loop using LangGraph."""
-    reset_tool_memory()
-
-    # Step 0: Hybrid GraphRAG entry points
-    if "Recommended Semantic Entry Points" not in problem_prompt:
-        entry_points = find_semantic_entry_points(graph, problem_prompt, top_k=2)
-        ep_block = format_entry_points_markdown(entry_points)
-        if ep_block:
-            problem_prompt = f"{problem_prompt}\n\n{ep_block}"
-    else:
-        entry_points = []
-
-    # Initialize tools and state graph
-    tools = create_cpg_langchain_tools(graph)
-    checkpointer = MemorySaver()
-    app = create_cpg_langgraph_agent(
-        model,
-        tools,
-        graph,
-        max_turns=max_turns,
-        max_patch_attempts=max_patch_attempts,
-        checkpointer=checkpointer,
-    )
-
-    initial_messages: List[BaseMessage] = [
-        SystemMessage(content=GRAPH_OF_THOUGHTS_SYSTEM_PROMPT),
-        HumanMessage(content=problem_prompt),
-    ]
-
-    initial_state: CPGDebugState = {
-        "messages": initial_messages,
-        "visited_nodes": [],
-        "visited_signatures": [],
-        "entry_points": entry_points,
-        "final_deduction": None,
-        "turn_count": 0,
-        "status": "IN_PROGRESS",
-        "patch_attempts": 0,
-        "max_patch_attempts": max_patch_attempts,
-        "failure_tracebacks": [],
-        "implicated_variables": [],
-    }
-
-    config = {"configurable": {"thread_id": thread_id}}
-
-    print("\n" + "=" * 60)
-    print("  Beginning LangGraph Autonomous Graph of Thoughts Loop")
-    print("=" * 60)
-
-    final_result = None
-    for event in app.stream(initial_state, config=config, stream_mode="updates"):
-        for node_name, node_output in event.items():
-            if node_name == "agent":
-                turn = node_output.get("turn_count", 0)
-                last_msg = node_output["messages"][-1]
-                print(f"\n--- [Turn {turn}/{max_turns}] Generating reasoning & actions ---")
-                print(f"[Model Output]:\n{last_msg.content}\n")
-
-                if node_output.get("final_deduction"):
-                    print("[+] Model finished reasoning and provided final deduction.")
-                    final_result = node_output["final_deduction"]
-
-            elif node_name == "tools":
-                for tm in node_output.get("messages", []):
-                    lines = len(tm.content.splitlines())
-                    print(f"[*] Executed Graph Tool: `{tm.name}` -> Returned {lines} lines.")
-                if node_output.get("status") == "SOLVED" and node_output.get("final_deduction"):
-                    print("[+] BLSP Runtime Verification succeeded (status='SOLVED'). Terminating graph.")
-                    final_result = node_output["final_deduction"]
-                elif node_output.get("status") == "FAILED_MAX_RETRIES" and node_output.get("final_deduction"):
-                    print("[!] Reached maximum BLSP patch retry attempts. Terminating graph.")
-                    final_result = node_output["final_deduction"]
-
-    if not final_result:
-        # Extract from the latest checkpoint
-        final_state = app.get_state(config).values
-        if final_state.get("final_deduction"):
-            final_result = final_state["final_deduction"]
-        elif final_state.get("messages"):
-            final_result = final_state["messages"][-1].content
-        else:
-            final_result = "No deduction produced."
-
-    return final_result
+    raise RuntimeError(f"Could not load model '{model_name}': {last_err}")

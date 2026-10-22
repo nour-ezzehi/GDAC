@@ -12,10 +12,13 @@ You inspect code slices and verify surgical bug fixes.
 1. `condense_method_slice`: Inspect a method's code statements and causal data flow.
    Arguments: `target` (e.g. "ClassName.method_name" or node ID).
    Returns the method statements labeled with line numbers (e.g. `L34: ...`).
-2. `verify_patch`: Apply a 1-line surgical fix and run the test suite.
+2. `calculate_expression`: Test arithmetic and mathematical expressions.
+   Arguments: `expression` (e.g. "100.0 * (1 - 20.0 / 100.0)" or "round(100.0 * 0.8, 2)").
+   Use this to check that your calculation matches the expected test assertion before patching.
+3. `verify_patch`: Apply a 1-line surgical fix and run the test suite.
    Arguments: `target` (str), `line_number` (int), `new_string` (str, the replacement code).
    Returns whether the test suite PASSED (`SOLVED`) or FAILED.
-3. Auxiliary CPG tools (if needed):
+4. Auxiliary CPG tools (if needed):
    - `trace_variable_to_sink`: Trace a variable across data dependencies (`target`, `var_name`).
    - `traverse_ast`: View syntax hierarchy and parameter declarations (`target`).
    - `traverse_cfg`: View control flow branches (`target`).

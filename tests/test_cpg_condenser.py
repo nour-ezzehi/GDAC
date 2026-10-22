@@ -25,19 +25,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cpg_bridge import (
+from gdac.services import (
+    compare_cpg_optimization,
+    condense_cpg,
+    condense_method_slice,
     find_nodes,
     load_cpg_json,
+    resolve_method_id,
     trace_variable_to_sink,
     traverse_ast,
     traverse_cfg,
     traverse_data_flow,
-)
-from cpg_condenser import (
-    compare_cpg_optimization,
-    condense_cpg,
-    condense_method_slice,
-    resolve_method_id,
 )
 
 
@@ -501,7 +499,7 @@ class TestRegressionFixes:
         a corrupted state variable over passive getters/readers with verbose docstrings, and
         properly splits camelCase identifiers.
         """
-        from cpg_rag import CPGSemanticIndex
+        from gdac.services import CPGSemanticIndex
 
         G = nx.MultiDiGraph()
         # Method 1: Verbose passive getter that reads `item.price` and mentions `price` many times
@@ -605,7 +603,7 @@ class TestRegressionFixes:
         `format_entry_points_markdown`) extracts `matched_target_vars` and emits a direct
         `condense_method_slice` handoff hint.
         """
-        from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
+        from gdac.services import find_semantic_entry_points, format_entry_points_markdown
 
         eps = find_semantic_entry_points(
             condensed_graph,

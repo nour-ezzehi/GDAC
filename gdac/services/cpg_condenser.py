@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 
 import networkx as nx
 
-from cpg_bridge import (
+from gdac.services.cpg_parser import (
     find_nodes,
     get_node_label_summary,
     load_cpg_json,

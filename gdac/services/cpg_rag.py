@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
-from cpg_bridge import find_nodes, traverse_ast
+from gdac.services.cpg_parser import find_nodes, traverse_ast
 
 
 class CPGSemanticIndex:

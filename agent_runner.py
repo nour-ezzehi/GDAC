@@ -19,14 +19,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from agent_prompt import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
-from agent_tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
-from cpg_bridge import load_cpg_json
-from cpg_condenser import condense_cpg, condense_method_slice
-from cpg_rag import find_semantic_entry_points, format_entry_points_markdown
+from gdac.prompts import GRAPH_OF_THOUGHTS_SYSTEM_PROMPT, format_user_problem_prompt
+from gdac.tools import TOOLS_SCHEMA, dispatch_tool, reset_tool_memory
+from gdac.services import (
+    condense_cpg,
+    condense_method_slice,
+    find_semantic_entry_points,
+    format_entry_points_markdown,
+    load_cpg_json,
+)
 
 try:
-    from agent_langchain import (
+    from gdac.agents import (
         LocalHuggingFaceChatModel,
         MockGoTChatModel,
         parse_tool_calls_from_text,
